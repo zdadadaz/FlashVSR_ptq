@@ -111,6 +111,9 @@ def main():
         help="Path to test dataset")
     parser.add_argument("--video", type=str, default=None,
         help="Specific video to use, or auto-select from dataset")
+    parser.add_argument("--quant", type=str, default="W8A16",
+        choices=["W8A16", "W8A8_SmoothQuant"],
+        help="Quantization mode to test")
     args = parser.parse_args()
 
     # Find video
@@ -170,7 +173,7 @@ def main():
 
     # --- Run W8A16 ---
     print("\n" + "="*50)
-    print("--- Running W8A16 Quantized Model ---")
+    print(f"--- Running {args.quant} Quantized Model ---")
     print("="*50)
     pipe_w8a16 = init_pipeline(
         model=args.model,
@@ -178,7 +181,7 @@ def main():
         device=args.device,
         dtype=dtype,
         vae_model="Wan2.1",
-        quantize_mode="W8A16"
+        quantize_mode=args.quant
     )
 
     torch.cuda.reset_peak_memory_stats()
@@ -198,10 +201,16 @@ def main():
 
     # --- Calculate PSNR ---
     psnr_w8a16 = calculate_psnr_tensor(baseline_output, w8a16_output)
+    print(f"\nDebug: baseline_output shape={baseline_output.shape}, device={baseline_output.device}")
+    print(f"Debug: w8a16_output shape={w8a16_output.shape}, device={w8a16_output.device}")
+    diff = baseline_output.float() - w8a16_output.float()
+    print(f"Debug: diff min={diff.min().item()}, max={diff.max().item()}, mean={diff.abs().mean().item()}")
+    mse = torch.mean(diff ** 2).item()
+    print(f"Debug: mse={mse}")
     print("\n" + "="*50)
     print("--- Quality Metrics ---")
     print("="*50)
-    print(f"PSNR (W8A16 vs Baseline): {psnr_w8a16:.2f} dB")
+    print(f"PSNR ({args.quant} vs Baseline): {psnr_w8a16:.2f} dB")
     if psnr_w8a16 > 30:
         print("Excellent! PSNR > 30 dB indicates no perceptible quality loss.")
     elif psnr_w8a16 > 25:

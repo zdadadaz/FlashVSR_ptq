@@ -909,7 +909,27 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
             from src.models.quantization.quant import convert_model_to_w8a16
         log("Applying W8A16 quantization to DiT model...", message_type='info', icon="🗜️")
         convert_model_to_w8a16(pipe.denoising_model())
-        
+
+    elif quantize_mode == "W8A8_SmoothQuant":
+        try:
+            from .src.models.quantization.quant import convert_model_to_w8a8_smoothquant
+            from .src.models.quantization.smoothquant import inject_observers, collect_activation_stats
+        except ImportError:
+            from src.models.quantization.quant import convert_model_to_w8a8_smoothquant
+            from src.models.quantization.smoothquant import inject_observers, collect_activation_stats
+        log("Running W8A8 SmoothQuant calibration...", message_type='info', icon="🗜️")
+        # Get dataset path
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        dataset_path = os.path.join(current_dir, "datasets", "test")
+        # Collect activation stats from calibration videos
+        act_stats = collect_activation_stats(
+            pipe.denoising_model(), dataset_path, pipe,
+            num_videos=3, frames_per_video=4
+        )
+        log(f"Calibration complete: collected stats from {len(act_stats)} layers", message_type='info', icon="✅")
+        log("Applying W8A8 SmoothQuant to DiT model...", message_type='info', icon="🗜️")
+        convert_model_to_w8a8_smoothquant(pipe.denoising_model(), act_stats, alpha=0.5)
+
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv(prompt_path=prompt_path)
     pipe.load_models_to_device(["dit","vae"])

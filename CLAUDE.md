@@ -126,3 +126,8 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+
+## keep on track
+1. plan and execution results save into logs with the date and time as filename 
+2. commit and push the modification 

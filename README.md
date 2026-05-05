@@ -359,6 +359,37 @@ flashvsr_model_path: ""
 
 ---
 
+## ⚡ Post-Training Quantization (PTQ)
+
+FlashVSR supports W8A16 quantization to reduce VRAM usage and improve inference speed with minimal quality loss.
+
+### PTQ Scripts
+
+```bash
+# Test quantization on dummy data (fast, no GPU memory needed)
+python scripts/ptq_test.py
+
+# Calibrate quantization with real data
+python scripts/ptq_calibrate.py
+
+# Convert model to quantized format
+python scripts/ptq_convert_w8a16.py
+```
+
+### PTQ Performance (Tested on RTX 4090 24GB)
+
+| Mode | VRAM | Speed | Quality (PSNR) |
+|:-----|:----:|:-----:|:--------------:|
+| Baseline (FP16/BF16) | 4.55 GB | 1.34s | - |
+| W8A16 Quantized | 3.13 GB | 0.44s | 22.40 dB |
+
+### Notes
+- W8A16 reduces weight precision to 8-bit integer while keeping activations in 16-bit floating point
+- Calibration with representative data recommended for optimal quality
+- VRAM reduction ~31% with 3x speedup on small inputs
+
+---
+
 ## 🏷️ Recent Changes
 
 See [CHANGELOG.md](CHANGELOG.md) for full version history.

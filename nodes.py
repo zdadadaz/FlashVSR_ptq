@@ -640,7 +640,7 @@ def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: i
     if w0 <= 0 or h0 <= 0:
         raise ValueError("invalid original size")
 
-    sW, sH = w0 * scale, h0 * scale
+    sW, sH = int(w0 * scale), int(h0 * scale)
     tW = math.ceil(sW / multiple) * multiple
     tH = math.ceil(sH / multiple) * multiple
     
@@ -662,7 +662,7 @@ def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: 
     h0, w0, c = frame_tensor.shape
     tensor_bchw = frame_tensor.permute(2, 0, 1).unsqueeze(0) # HWC -> CHW -> BCHW
     
-    sW, sH = w0 * scale, h0 * scale
+    sW, sH = int(w0 * scale), int(h0 * scale)
     upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode='bicubic', align_corners=False)
     
     # Apply symmetric padding to reach target dimensions
@@ -764,7 +764,7 @@ def create_feather_mask(size, overlap):
     
     return mask
 
-def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
+def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode="None"):
     """
     Initialize FlashVSR pipeline with specified model and VAE type.
     
@@ -901,6 +901,15 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu", weights_only=False), strict=True)
     pipe.denoising_model().LQ_proj_in.to(device)
     pipe.to(device, dtype=dtype)
+    
+    if quantize_mode == "W8A16":
+        try:
+            from .src.models.quantization.quant import convert_model_to_w8a16
+        except ImportError:
+            from src.models.quantization.quant import convert_model_to_w8a16
+        log("Applying W8A16 quantization to DiT model...", message_type='info', icon="🗜️")
+        convert_model_to_w8a16(pipe.denoising_model())
+        
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv(prompt_path=prompt_path)
     pipe.load_models_to_device(["dit","vae"])
@@ -911,7 +920,8 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     if hasattr(pipe, 'vae') and pipe.vae is not None:
         vae_info += f" ({type(pipe.vae).__name__})"
     
-    log(f"Pipeline Initialized: Mode={mode}, Device={device}, Dtype={dtype}, Attention={wan_video_dit.ATTENTION_MODE}", message_type='info', icon="🔧")
+    attn_mode = getattr(wan_video_dit, 'ATTENTION_MODE', 'sparse_sage_attention')
+    log(f"Pipeline Initialized: Mode={mode}, Device={device}, Dtype={dtype}, Attention={attn_mode}", message_type='info', icon="🔧")
     log(f"Model: {model}, {vae_info}", message_type='info', icon="📦")
 
     return pipe
@@ -1001,7 +1011,7 @@ class cqdm:
     def __len__(self):
         return self.total
 
-def process_chunk(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug, is_single_frame_input=False):
+def process_chunk(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug, is_single_frame_input=False, context_pad=0):
     """
     Processes a single chunk of frames.
     
@@ -1062,8 +1072,14 @@ def process_chunk(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, t
                 super().__init__(iterable, total=total, desc=desc)
 
         for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, total=len(tile_coords), desc="Tiled Tiles", enable_debug=enable_debug)):
-            # All frames for this spatial tile → enough for streaming pipeline
-            input_tile = _frames[:, y1:y2, x1:x2, :]  # (N, tile_h, tile_w, C)
+            # Expand crop bounds by context_pad so the model sees neighboring pixels,
+            # reducing content discontinuities at tile boundaries.
+            x1_ctx = max(0, x1 - context_pad)
+            y1_ctx = max(0, y1 - context_pad)
+            x2_ctx = min(W, x2 + context_pad)
+            y2_ctx = min(H, y2 + context_pad)
+
+            input_tile = _frames[:, y1_ctx:y2_ctx, x1_ctx:x2_ctx, :]  # (N, expanded_h, expanded_w, C)
 
             LQ_tile, th, tw, F, tile_sH, tile_sW, tile_pad_top, tile_pad_left = prepare_input_tensor(
                 input_tile, _device, scale=scale, dtype=dtype
@@ -1081,11 +1097,27 @@ def process_chunk(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, t
 
             processed_tile = tensor2video(output_tile_gpu).to('cpu')  # (F_out, tH, tW, C)
 
-            # Crop spatial padding
+            # Crop prepare_input_tensor padding (alignment/temporal padding)
             max_crop_h = min(tile_pad_top + tile_sH, processed_tile.shape[1])
             max_crop_w = min(tile_pad_left + tile_sW, processed_tile.shape[2])
             if max_crop_h > tile_pad_top and max_crop_w > tile_pad_left:
                 processed_tile = processed_tile[:, tile_pad_top:max_crop_h, tile_pad_left:max_crop_w, :]
+
+            # Crop context padding out of the upscaled output so only the
+            # original tile region remains before feather-blending into the canvas.
+            if context_pad > 0:
+                ctx_top   = (y1 - y1_ctx) * scale
+                ctx_left  = (x1 - x1_ctx) * scale
+                ctx_bot   = (y2_ctx - y2) * scale
+                ctx_right = (x2_ctx - x2) * scale
+                h_out = processed_tile.shape[1]
+                w_out = processed_tile.shape[2]
+                processed_tile = processed_tile[
+                    :,
+                    ctx_top : h_out - ctx_bot if ctx_bot > 0 else h_out,
+                    ctx_left : w_out - ctx_right if ctx_right > 0 else w_out,
+                    :
+                ]
 
             n_valid = min(processed_tile.shape[0], N)
 
@@ -1173,7 +1205,7 @@ def process_chunk(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, t
 
     return final_output[:frames.shape[0], :, :, :]
 
-def flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0, mode="full"):
+def flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0, mode="full", context_pad=0):
     """
     =============================================================================
     FIX 9 & 10: Unified Processing Pipeline with Pre-Flight Check
@@ -1299,7 +1331,7 @@ def flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_
                         pipe, chunk_frames, scale, color_fix, color_fix_method, current_tiled_vae, current_tiled_dit,
                         tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
                         local_range, seed, force_offload, enable_debug,
-                        is_single_frame_input=is_single_frame_input
+                        is_single_frame_input=is_single_frame_input, context_pad=context_pad
                     )
                     final_outputs.append(chunk_out.cpu())
                     del chunk_out
@@ -1334,7 +1366,7 @@ def flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_
                     pipe, frames, scale, color_fix, color_fix_method, current_tiled_vae, current_tiled_dit,
                     tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
                     local_range, seed, force_offload, enable_debug,
-                    is_single_frame_input=is_single_frame_input
+                    is_single_frame_input=is_single_frame_input, context_pad=context_pad
                 )
                 break
             except torch.OutOfMemoryError as e:
@@ -1413,6 +1445,10 @@ class FlashVSRNodeInitPipe:
                     "default": "sparse_sage_attention",
                     "tooltip": 'Attention mechanism backend. "sparse_sage"/"block_sparse" use efficient sparse attention. "flash_attention_2"/"sdpa" use dense attention (slower, more VRAM).'
                 }),
+                "quantize_mode": (["None", "W8A16", "W8A8_SmoothQuant"], {
+                    "default": "None",
+                    "tooltip": "Quantization mode to reduce VRAM. W8A16 dynamically halves weight VRAM. W8A8 (planned) quantizes both weights and activations."
+                }),
             }
         }
     
@@ -1422,7 +1458,7 @@ class FlashVSRNodeInitPipe:
     CATEGORY = "FlashVSR"
     DESCRIPTION = 'Initializes the FlashVSR pipeline. 5 VAE options: Wan2.1, Wan2.2, LightVAE_W2.1, TAE_W2.2, LightTAE_HY1.5. Auto-downloads missing files.'
     
-    def main(self, model, mode, vae_model, force_offload, precision, device, attention_mode):
+    def main(self, model, mode, vae_model, force_offload, precision, device, attention_mode, quantize_mode="None"):
         _device = device
         if device == "auto":
             _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -1454,7 +1490,7 @@ class FlashVSRNodeInitPipe:
             dtype = torch.bfloat16
 
         # Use unified vae_model parameter
-        pipe = init_pipeline(model, mode, _device, dtype, vae_model=vae_model)
+        pipe = init_pipeline(model, mode, _device, dtype, vae_model=vae_model, quantize_mode=quantize_mode)
         # FIX 10: Store mode with pipe for unified processing logic
         return((pipe, force_offload, mode),)
 
@@ -1504,6 +1540,13 @@ class FlashVSRNodeAdv:
                     "max": 512,
                     "step": 8,
                     "tooltip": "Overlap pixels between tiles to blend seams. Higher overlap = smoother transitions but more computation."
+                }),
+                "context_pad": ("INT", {
+                    "default": 64,
+                    "min": 0,
+                    "max": 256,
+                    "step": 16,
+                    "tooltip": "Context pixels added around each DiT tile input. Lets the model see neighboring content when upscaling tile edges, reducing content discontinuities at tile boundaries. 0 = disabled."
                 }),
                 "unload_dit": ("BOOLEAN", {
                     "default": False,
@@ -1565,7 +1608,7 @@ class FlashVSRNodeAdv:
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
     
-    def main(self, pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, frame_chunk_size, enable_debug, keep_models_on_cpu, resize_factor):
+    def main(self, pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, context_pad, unload_dit, sparse_ratio, kv_ratio, local_range, seed, frame_chunk_size, enable_debug, keep_models_on_cpu, resize_factor):
         # Extract local_range int from dropdown string
         local_range_int = int(local_range.split(" ")[0])
         # FIX 10: Extract mode from pipe tuple for unified processing
@@ -1576,7 +1619,7 @@ class FlashVSRNodeAdv:
         else:
             _pipe = pipe[0]
             mode = "full"  # Default fallback for backwards compatibility
-        output = flashvsr(_pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range_int, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
+        output = flashvsr(_pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range_int, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode, context_pad=context_pad)
         return(output.cpu().float(),)
 
 class FlashVSRNode:

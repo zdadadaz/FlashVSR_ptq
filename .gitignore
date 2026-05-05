@@ -212,3 +212,4 @@ __marimo__/
 .DS_Store
 
 models/
+datasets/

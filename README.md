@@ -248,6 +248,7 @@ All arguments map 1:1 with ComfyUI node inputs. Run `python cli_main.py --help` 
 | `--force_offload` | flag | `True` | Force offload models to CPU after execution |
 | `--no_force_offload` | flag | - | Disable force offloading |
 | `--precision` | choice | `auto` | Precision: `fp16`, `bf16`, `auto` |
+| `--quantize_mode` | choice | `None` | Quantization: `None`, `W8A16`, `W8A8_SmoothQuant` |
 | `--device` | string | `auto` | Device: `cuda:0`, `cuda:1`, `cpu`, `auto` |
 | `--attention_mode` | choice | `sparse_sage_attention` | Attention: `sparse_sage_attention`, `block_sparse_attention`, `flash_attention_2`, `sdpa` |
 
@@ -363,30 +364,68 @@ flashvsr_model_path: ""
 
 FlashVSR supports W8A16 quantization to reduce VRAM usage and improve inference speed with minimal quality loss.
 
-### PTQ Scripts
+### 1. Generate W8A16 Model
+
+Convert official FP16/BF16 weights to 8-bit weight format (saves ~1.5GB VRAM):
 
 ```bash
-# Test quantization on dummy data (fast, no GPU memory needed)
-python scripts/ptq_test.py
-
-# Calibrate quantization with real data
-python scripts/ptq_calibrate.py
-
-# Convert model to quantized format
-python scripts/ptq_convert_w8a16.py
+python scripts/ptq_convert_w8a16.py \
+    --input_ckpt models/FlashVSR-v1.1/diffusion_pytorch_model_streaming_dmd.safetensors \
+    --output_ckpt models/FlashVSR-v1.1/diffusion_pytorch_model_w8a16.safetensors
 ```
 
-### PTQ Performance (Tested on RTX 4090 24GB)
+### 2. Quantized Inference (CLI)
+
+Run inference using your pre-quantized model. The CLI includes auto-recovery logic to handle VRAM spikes.
+
+#### **Standard Test (2x Tiny Mode)**
+```bash
+python cli_main.py \
+    --input input.mp4 \
+    --output output_w8a16.mp4 \
+    --scale 2 \
+    --mode tiny \
+    --quantize_mode W8A16 \
+    --ckpt_path models/FlashVSR-v1.1/diffusion_pytorch_model_w8a16.safetensors
+```
+
+#### **High Resolution (4x Full Mode)**
+For 4x upscale in `full` mode, use these settings to prevent OOM on 24GB GPUs:
+```bash
+python cli_main.py \
+    --input input.mp4 \
+    --output output_4x_full_q.mp4 \
+    --scale 4 \
+    --mode full \
+    --frame_chunk_size 4 \
+    --unload_dit \
+    --quantize_mode W8A16 \
+    --ckpt_path models/FlashVSR-v1.1/diffusion_pytorch_model_w8a16.safetensors \
+    --no_color_fix
+```
+
+### PTQ Performance (Tested on RTX 3090/4090)
 
 | Mode | VRAM | Speed | Quality (PSNR) |
 |:-----|:----:|:-----:|:--------------:|
-| Baseline (FP16/BF16) | 4.55 GB | 1.34s | - |
-| W8A16 Quantized | 3.13 GB | 0.44s | 22.40 dB |
+| Baseline (FP16/BF16) | ~9.9 GB | 2.47 FPS | - |
+| W8A16 Quantized | ~8.5 GB | 3.11 FPS | >22 dB |
 
-### Notes
-- W8A16 reduces weight precision to 8-bit integer while keeping activations in 16-bit floating point
-- Calibration with representative data recommended for optimal quality
-- VRAM reduction ~31% with 3x speedup on small inputs
+### Key Quantization Arguments
+- `--quantize_mode W8A16`: Enables the internal quantization logic.
+- `--ckpt_path`: Path to your custom `.safetensors` or `.pth` (required for pre-quantized models).
+- `--frame_chunk_size 4`: Limits temporal frames processed by TCDecoder (critical for 4x).
+- `--unload_dit`: Moves DiT to CPU before VAE starts, freeing VRAM for decoding.
+
+### PTQ Development Scripts
+
+```bash
+# Test quantization on dummy data
+python scripts/ptq_test.py
+
+# Calibrate quantization with real data (DOVE dataset)
+python scripts/ptq_calibrate.py
+```
 
 ---
 

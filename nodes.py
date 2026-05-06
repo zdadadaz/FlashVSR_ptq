@@ -764,32 +764,22 @@ def create_feather_mask(size, overlap):
     
     return mask
 
-def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode="None"):
+def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode="None", ckpt_path=None):
     """
     Initialize FlashVSR pipeline with specified model and VAE type.
-    
-    =============================================================================
-    FIX 2 & 7: STRICT VAE file path mapping with EXPLICIT class instantiation
-    =============================================================================
-    - vae_model: Unified VAE selection from dropdown (5 options)
-    - Each VAE selection loads a DISTINCT file (no file reuse)
-    - EXPLICIT class instantiation based on selection - NO guessing from state_dict
-    
-    File Mapping:
-    - "Wan2.1" -> Wan2.1_VAE.pth -> WanVideoVAE
-    - "Wan2.2" -> Wan2.2_VAE.pth -> Wan22VideoVAE
-    - "LightVAE_W2.1" -> lightvaew2_1.pth -> LightX2VVAE
-    - "TAE_W2.2" -> taew2_2.safetensors -> Wan22VideoVAE
-    - "LightTAE_HY1.5" -> lighttaehy1_5.pth -> LightX2VVAE
     """
     model_download(model_name="JunhaoZhuang/"+model)
     base_dir = get_flashvsr_model_base_dir()
     model_path = os.path.join(base_dir, model)
     if not os.path.exists(model_path):
         raise RuntimeError(f'Model directory does not exist!\nPlease save all weights to "{model_path}"')
-    ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")
+    
+    # Use custom ckpt_path if provided, otherwise use default
+    if ckpt_path is None:
+        ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")
+    
     if not os.path.exists(ckpt_path):
-        raise RuntimeError(f'"diffusion_pytorch_model_streaming_dmd.safetensors" does not exist!\nPlease save it to "{model_path}"')
+        raise RuntimeError(f'Checkpoint file "{ckpt_path}" does not exist!')
     
     # ==========================================================================
     # FIX 2 & 7: VAE Model Loading - EXPLICIT mapping (no guessing!)
@@ -826,8 +816,51 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
     prompt_path = os.path.join(current_dir, "posi_prompt.pth")
     
     mm = ModelManager(torch_dtype=dtype, device="cpu")
-    if mode == "full":
+    
+    # Handle quantized DiT model loading manually if needed
+    if "w8a16" in ckpt_path.lower():
+        log(f"Manual loading detected for quantized DiT: {ckpt_path}", message_type='info', icon="🔍")
+        # Instantiate model structure
+        try:
+            from .src.models.wan_video_dit import WanModel
+            from .src.models.quantization.quant import convert_model_to_w8a16
+        except ImportError:
+            from src.models.wan_video_dit import WanModel
+            from src.models.quantization.quant import convert_model_to_w8a16
+        
+        # FlashVSR-v1.1 config
+        dit = WanModel(
+            dim=1536, eps=1e-5, ffn_dim=8960, freq_dim=256, in_dim=16,
+            num_heads=12, num_layers=30, out_dim=16, patch_size=(1, 2, 2), text_dim=4096
+        )
+        # Convert structure to W8A16 BEFORE loading weights
+        convert_model_to_w8a16(dit)
+        
+        # Load state dict
+        if ckpt_path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            sd_dit = load_file(ckpt_path)
+        else:
+            sd_dit = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            
+        new_sd = {}
+        for k, v in sd_dit.items():
+            if k.startswith("model."): new_sd[k[6:]] = v
+            else: new_sd[k] = v
+        dit.load_state_dict(new_sd, strict=False)
+        
+        # Manually register in ModelManager
+        mm.model.append(dit.eval())
+        mm.model_path.append(ckpt_path)
+        mm.model_name.append("wan_video_dit")
+        
+        # Load VAE separately
+        mm.load_models([vae_path])
+    else:
+        # Standard loading
         mm.load_models([ckpt_path, vae_path])
+
+    if mode == "full":
         pipe = FlashVSRFullPipeline.from_model_manager(mm, device=device)
 
         # =======================================================================
@@ -884,7 +917,10 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
         pipe.TCDecoder.clean_mem()
         log(f"Loaded TCDecoder for Full Mode (official FlashVSR approach)", message_type='info', icon="✅")
     else:
-        mm.load_models([ckpt_path])
+        # For non-full modes, we still need to load VAE to the model manager if not manually handled
+        if not ("w8a16" in ckpt_path.lower()):
+            mm.load_models([ckpt_path, vae_path])
+            
         if mode == "tiny":
             pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device)
         else:
@@ -903,12 +939,17 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
     pipe.to(device, dtype=dtype)
     
     if quantize_mode == "W8A16":
-        try:
-            from .src.models.quantization.quant import convert_model_to_w8a16
-        except ImportError:
-            from src.models.quantization.quant import convert_model_to_w8a16
-        log("Applying W8A16 quantization to DiT model...", message_type='info', icon="🗜️")
-        convert_model_to_w8a16(pipe.denoising_model())
+        # Check if the loaded checkpoint was already quantized (filename contains w8a16)
+        # If it was, we already handled structural conversion and weight loading in the manual load block above.
+        if "w8a16" in ckpt_path.lower():
+            log(f"W8A16 model already active from pre-quantized checkpoint.", message_type='info', icon="🗜️")
+        else:
+            try:
+                from .src.models.quantization.quant import convert_model_to_w8a16
+            except ImportError:
+                from src.models.quantization.quant import convert_model_to_w8a16
+            log("Applying ON-THE-FLY W8A16 quantization to DiT model...", message_type='info', icon="🗜️")
+            convert_model_to_w8a16(pipe.denoising_model())
 
     elif quantize_mode == "W8A8_SmoothQuant":
         try:

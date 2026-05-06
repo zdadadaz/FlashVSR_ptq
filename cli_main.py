@@ -127,6 +127,19 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         default='sparse_sage_attention',
         help='Attention mechanism backend. "sparse_sage"/"block_sparse" use efficient sparse attention. "flash_attention_2"/"sdpa" use dense attention. (default: sparse_sage_attention)'
     )
+    parser.add_argument(
+        '--quantize_mode',
+        type=str,
+        choices=['None', 'W8A16', 'W8A8_SmoothQuant'],
+        default='None',
+        help='Quantization mode for the DiT model. "None": standard precision. "W8A16": 8-bit weights, 16-bit activations. "W8A8_SmoothQuant": 8-bit weights and activations (requires calibration). (default: None)'
+    )
+    parser.add_argument(
+        '--ckpt_path',
+        type=str,
+        default=None,
+        help='Path to a custom DiT checkpoint (e.g., a pre-quantized model).'
+    )
 
     # ==========================================================================
     # FlashVSRNodeAdv parameters (Processing)
@@ -506,6 +519,9 @@ def main():
     # Load input video (Lazily)
     # ==========================================================================
     print("\nInitializing Video Reader...")
+    # Pass chunk_size=0 to VideoReader so it reads the FULL video (or as much as fits in RAM)
+    # and let the flashvsr internal chunking handle VRAM chunks.
+    # However, if the user wants CLI-level chunking, we keep it as is but pass it to flashvsr too.
     reader = VideoReader(
         args.input, 
         start_frame=args.start_frame, 
@@ -558,7 +574,9 @@ def main():
         mode=args.mode,
         device=device,
         dtype=dtype,
-        vae_model=args.vae_model
+        vae_model=args.vae_model,
+        quantize_mode=args.quantize_mode,
+        ckpt_path=args.ckpt_path
     )
     
     # ==========================================================================
@@ -597,8 +615,6 @@ def main():
                   f"Elapsed: {formatted_elapsed} | ETA: {formatted_eta} | Speed: {speed_fps:.2f} fps")
             
             # Process the chunk
-            # Note: We pass chunk_size=0 to flashvsr because we are feeding it an explicit chunk
-            # that we want processed fully right now.
             output_frames = flashvsr(
                 pipe=pipe,
                 frames=frames,
@@ -614,9 +630,9 @@ def main():
                 kv_ratio=args.kv_ratio,
                 local_range=args.local_range,
                 seed=args.seed,
-                force_offload=keep_models_on_cpu,  # flashvsr() uses force_offload param for CPU offloading
+                force_offload=force_offload,  
                 enable_debug=args.enable_debug,
-                chunk_size=0, # Already chunked
+                chunk_size=args.frame_chunk_size, # ENABLE internal chunking
                 resize_factor=args.resize_factor,
                 mode=args.mode
             )

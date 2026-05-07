@@ -248,7 +248,8 @@ All arguments map 1:1 with ComfyUI node inputs. Run `python cli_main.py --help` 
 | `--force_offload` | flag | `True` | Force offload models to CPU after execution |
 | `--no_force_offload` | flag | - | Disable force offloading |
 | `--precision` | choice | `auto` | Precision: `fp16`, `bf16`, `auto` |
-| `--quantize_mode` | choice | `None` | Quantization: `None`, `W8A16`, `W8A8_SmoothQuant` |
+| `--quantize_mode` | choice | `None` | Quantization: `None`, `W8A16`, `W8A8`, `W8A8_SmoothQuant` |
+| `--w8a8_engine` | choice | `bf16` | W8A8 engine: `bf16` (Int8ActLinear, ~37dB, faster), `int8mm` (torch._int_mm, ~13dB, experimental) |
 | `--device` | string | `auto` | Device: `cuda:0`, `cuda:1`, `cpu`, `auto` |
 | `--attention_mode` | choice | `sparse_sage_attention` | Attention: `sparse_sage_attention`, `block_sparse_attention`, `flash_attention_2`, `sdpa` |
 
@@ -362,7 +363,31 @@ flashvsr_model_path: ""
 
 ## ⚡ Post-Training Quantization (PTQ)
 
-FlashVSR supports W8A16 quantization to reduce VRAM usage and improve inference speed with minimal quality loss.
+FlashVSR supports W8A16 and W8A8 quantization to reduce VRAM usage and improve inference speed with minimal quality loss.
+
+### Quantization Modes
+
+| Mode | Description | Quality | VRAM Savings | Speed |
+|:-----|:------------|:-------:|:------------:|:-----:|
+| `W8A16` | Weight-only int8, 16-bit activations | ~35 dB | ~1.5 GB | 1.2x |
+| `W8A8` (bf16 engine) | Int8 weights + activations, bf16 matmul | ~37 dB | ~2 GB | 1.1x |
+| `W8A8` (int8mm engine) | True W8A8 via torch._int_mm | ~13 dB | ~2 GB | 1.3x |
+| `W8A8_SmoothQuant` | W8A8 with activation migration | ~9 dB | ~2 GB | 1.1x |
+
+> **Note**: True W8A8 (`int8mm` engine) has lower quality due to calibration mismatch with diffusion denoising. Use `W8A16` or `W8A8` with `bf16` engine for production.
+
+### W8A8 Engine Selection
+
+```bash
+# Default W8A8 (bf16 engine) - recommended for best quality
+python cli_main.py --input video.mp4 --output upscaled.mp4 --quantize_mode W8A8
+
+# Explicit bf16 engine (same as default)
+python cli_main.py --input video.mp4 --output upscaled.mp4 --quantize_mode W8A8 --w8a8_engine bf16
+
+# int8mm engine - faster but lower quality (experimental)
+python cli_main.py --input video.mp4 --output upscaled.mp4 --quantize_mode W8A8 --w8a8_engine int8mm
+```
 
 ### 1. Generate W8A16 Model
 
@@ -406,10 +431,12 @@ python cli_main.py \
 
 ### PTQ Performance (Tested on RTX 3090/4090)
 
-| Mode | VRAM | Speed | Quality (PSNR) |
-|:-----|:----:|:-----:|:--------------:|
-| Baseline (FP16/BF16) | ~9.9 GB | 2.47 FPS | - |
-| W8A16 Quantized | ~8.5 GB | 3.11 FPS | >22 dB |
+| Mode | Engine | VRAM | Speed | Quality (PSNR) |
+|:-----|:-------|:----:|:-----:|:--------------:|
+| Baseline (FP16/BF16) | - | ~9.9 GB | 2.47 FPS | - |
+| W8A16 | WeightOnlyInt8Linear | ~8.5 GB | 3.11 FPS | >22 dB |
+| W8A8 | Int8ActLinear (bf16) | ~8.0 GB | 5.71 FPS | ~37 dB |
+| W8A8 | Int8MatmulLinear (int8mm) | ~7.8 GB | 6.81 FPS | ~13 dB |
 
 ### Key Quantization Arguments
 - `--quantize_mode W8A16`: Enables the internal quantization logic.

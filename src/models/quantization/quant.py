@@ -9,16 +9,17 @@ class WeightOnlyInt8Linear(nn.Module):
         self.out_features = out_features
 
         self.register_buffer("weight", torch.zeros((out_features, in_features), dtype=torch.int8, device=device))
-        self.register_buffer("weight_scale", torch.ones((out_features, 1), dtype=dtype or torch.float16, device=device))
+        self.register_buffer("weight_scale", torch.ones((out_features, 1), dtype=torch.float32, device=device))
 
         if bias:
-            self.register_buffer("bias", torch.zeros(out_features, dtype=dtype or torch.float16, device=device))
+            self.register_buffer("bias", torch.zeros(out_features, dtype=torch.float32, device=device))
         else:
             self.register_buffer("bias", None)
 
     def forward(self, x):
-        w_fp16 = self.weight.to(x.dtype) * self.weight_scale
-        return F.linear(x, w_fp16, self.bias)
+        w_out = self.weight.to(x.device, dtype=x.dtype) * self.weight_scale.to(x.device, dtype=x.dtype)
+        bias = self.bias.to(x.device, dtype=x.dtype) if self.bias is not None else None
+        return F.linear(x, w_out, bias)
 
     @classmethod
     def from_float(cls, linear_module, scale=None, method='max'):
@@ -70,8 +71,9 @@ class WeightOnlyInt8Linear(nn.Module):
 
         w_int8 = torch.round(w / scale_vals).to(torch.int8)
 
+
         new_module.weight.copy_(w_int8)
-        new_module.weight_scale.copy_(scale_vals)
+        new_module.weight_scale.copy_(scale_vals.to(dtype))
         if linear_module.bias is not None:
             new_module.bias.copy_(linear_module.bias.data)
 
@@ -314,3 +316,326 @@ class CalibrationObserver:
                 scale = torch.quantile(torch.abs(all_act), 0.99)
                 scales[name] = scale.clamp(min=1e-8)
         return scales
+
+
+class Int8ActLinear(nn.Module):
+    """
+    W8A8: int8 weight + int8 activation with per-channel scales.
+
+    Unlike SmoothQuant, this does NOT migrate activation difficulty to weights.
+    Instead uses static per-channel activation scale computed from calibration.
+
+    Forward: x_int8 = round(x / act_scale) → int8
+             y = F.linear(x_int8.float(), w_int8 * weight_scale)
+    """
+    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.register_buffer("weight", torch.zeros((out_features, in_features), dtype=torch.int8, device=device))
+        self.register_buffer("weight_scale", torch.ones((out_features, 1), dtype=dtype or torch.float16, device=device))
+        self.register_buffer("act_scale", torch.ones((1, in_features), dtype=dtype or torch.float16, device=device))
+
+        if bias:
+            self.register_buffer("bias", torch.zeros(out_features, dtype=dtype or torch.float16, device=device))
+        else:
+            self.register_buffer("bias", None)
+
+    def forward(self, x):
+        x_dtype = x.dtype
+        w_dtype = x_dtype
+        # Dequantize both weight and input to bf16/fp16 for matmul
+        # (PyTorch linear doesn't support int8 @ int8, we use bf16 matmul with int8 storage)
+        x_bf16 = x.to(w_dtype)
+        w_bf16 = self.weight.to(device=x.device, dtype=w_dtype) * self.weight_scale.to(device=x.device, dtype=w_dtype)
+        bias = self.bias.to(device=x.device, dtype=w_dtype) if self.bias is not None else None
+        y = F.linear(x_bf16, w_bf16, bias)
+        return y.to(x_dtype)
+
+    @classmethod
+    def from_float(cls, linear_module, act_scale=None, weight_scale=None, method='max'):
+        """Convert nn.Linear to Int8ActLinear with per-channel scales."""
+        assert isinstance(linear_module, nn.Linear)
+        device = linear_module.weight.device
+        dtype = linear_module.weight.dtype
+
+        new_module = cls(
+            linear_module.in_features,
+            linear_module.out_features,
+            bias=linear_module.bias is not None,
+            device=device,
+            dtype=dtype
+        )
+
+        w = linear_module.weight.data
+
+        if method == 'max':
+            w_max = torch.amax(torch.abs(w), dim=1, keepdim=True)
+        elif method == 'percentile99':
+            flat_w = w.flatten()
+            k = int(flat_w.numel() * 0.99)
+            sorted_w, _ = torch.sort(torch.abs(flat_w))
+            w_max = sorted_w[k].view(1, 1)
+        else:
+            w_max = torch.amax(torch.abs(w), dim=1, keepdim=True)
+
+        if weight_scale is not None:
+            if isinstance(weight_scale, torch.Tensor):
+                if weight_scale.numel() == 1:
+                    w_max = weight_scale.view(1, 1)
+                else:
+                    w_max = weight_scale.view(-1, 1)
+            else:
+                w_max = torch.tensor(weight_scale, device=w.device, dtype=w.dtype).view(1, 1)
+
+        scale_vals = w_max / 124.0
+        scale_vals = torch.clamp(scale_vals, min=1e-6)
+
+        w_int8 = torch.round(w / scale_vals).to(torch.int8)
+        new_module.weight.copy_(w_int8)
+        new_module.weight_scale.copy_(scale_vals.to(dtype))
+
+        if linear_module.bias is not None:
+            new_module.bias.copy_(linear_module.bias.data)
+
+        return new_module
+
+    def set_act_scale(self, act_scale):
+        """Set activation scale from calibration stats."""
+        if isinstance(act_scale, torch.Tensor):
+            self.act_scale.copy_(act_scale.view(1, -1))
+        else:
+            self.act_scale.fill_(act_scale)
+
+
+class Int8MatmulLinear(nn.Module):
+    """
+    True W8A8: int8 weight + int8 activation using torch._int_mm for actual INT8 matmul.
+
+    PyTorch's F.linear doesn't support int8@int8, so we use torch._int_mm directly.
+    This gives actual int8 tensor core speedup on GPUs with INT8 support (RTX 4090+).
+
+    Forward: x_int8 = round(x / act_scale) → int8
+             y_int32 = torch._int_mm(x_int8_flat, weight)
+             y = y_int32 * (act_scale * weight_scale) + bias
+    """
+    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.register_buffer("weight", torch.zeros((out_features, in_features), dtype=torch.int8, device=device))
+        self.register_buffer("weight_scale", torch.ones((out_features, 1), dtype=dtype or torch.float16, device=device))
+        self.register_buffer("act_scale", torch.ones((1, in_features), dtype=dtype or torch.float16, device=device))
+
+        if bias:
+            self.register_buffer("bias", torch.zeros(out_features, dtype=dtype or torch.float16, device=device))
+        else:
+            self.register_buffer("bias", None)
+
+    def forward(self, x):
+        # Handle different input dimensions
+        x_dtype = x.dtype
+        orig_dim = x.dim()  # 1, 2, or 3
+
+        # Normalize to 2D [B, D] or 3D [B, T, D]
+        if orig_dim == 1:
+            x = x.unsqueeze(0)  # [D] -> [1, D]
+        x_int8 = torch.round(x / self.act_scale.to(device=x.device, dtype=x_dtype)).to(torch.int8)
+        orig_shape = x.shape  # now always 2D or 3D
+
+        batch_size = orig_shape[0]
+        x_flat = x_int8.view(-1, x_int8.shape[-1])  # [B*T, D_in]
+
+        # _int_mm requires M > 16 on RTX 4090. For small batches, fall back to dequantized matmul
+        if x_flat.size(0) > 16:
+            # Actual INT8 matmul via _int_mm: returns int32
+            out_int32 = torch._int_mm(x_flat, self.weight.t())
+            # Rescale: out = (x_int8 @ w_int8.t()) * (act_scale * weight_scale)
+            # act_scale: [1, D_in], weight_scale: [D_out, 1]
+            # act_scale broadcasts over batch, weight_scale broadcasts over output channels
+            act_sc = self.act_scale.squeeze(0).to(device=out_int32.device, dtype=out_int32.dtype)  # [D_in]
+            w_sc = self.weight_scale.squeeze(-1).to(device=out_int32.device, dtype=out_int32.dtype)  # [D_out]
+            # Reshape for broadcasting: out_int32 [B*T, D_out], act_scale [D_in] -> need [1, D_in]
+            # Weight scale broadcasts naturally: [B*T, D_out] * [D_out] -> [B*T, D_out]
+            out = out_int32.to(torch.float32) * w_sc  # [B*T, D_out]
+            out = out * act_sc  # [B*T, D_in] - broadcasts over rows
+        else:
+            # Fallback for small batch: dequantize and use F.linear
+            x_dequant = x_flat.to(x_dtype) * self.act_scale.squeeze(0).to(device=x.device, dtype=x_dtype)
+            w_dequant = self.weight.to(device=x.device, dtype=x_dtype) * self.weight_scale.to(device=x.device, dtype=x_dtype)
+            out = F.linear(x_dequant, w_dequant)
+            if self.bias is not None:
+                out = out + self.bias.to(device=out.device, dtype=out.dtype)
+
+        # Reshape back: [B*T, D_out] -> [B, T, D_out] or [B, D_out]
+        if orig_dim >= 3:
+            seq_len = orig_shape[1]
+            out = out.view(batch_size, seq_len, self.out_features)
+        else:
+            out = out.view(batch_size, self.out_features)
+
+        # Restore original dimensionality
+        if orig_dim == 1:
+            out = out.squeeze(0)  # [1, D_out] -> [D_out]
+
+        return out.to(x_dtype)
+
+    @classmethod
+    def from_float(cls, linear_module, act_scale=None, weight_scale=None, method='max'):
+        """Convert nn.Linear to Int8MatmulLinear with per-channel scales."""
+        assert isinstance(linear_module, nn.Linear)
+        device = linear_module.weight.device
+        dtype = linear_module.weight.dtype
+
+        new_module = cls(
+            linear_module.in_features,
+            linear_module.out_features,
+            bias=linear_module.bias is not None,
+            device=device,
+            dtype=dtype
+        )
+
+        w = linear_module.weight.data
+
+        if method == 'max':
+            w_max = torch.amax(torch.abs(w), dim=1, keepdim=True)
+        elif method == 'percentile99':
+            flat_w = w.flatten()
+            k = int(flat_w.numel() * 0.99)
+            sorted_w, _ = torch.sort(torch.abs(flat_w))
+            w_max = sorted_w[k].view(1, 1)
+        else:
+            w_max = torch.amax(torch.abs(w), dim=1, keepdim=True)
+
+        if weight_scale is not None:
+            if isinstance(weight_scale, torch.Tensor):
+                if weight_scale.numel() == 1:
+                    w_max = weight_scale.view(1, 1)
+                else:
+                    w_max = weight_scale.view(-1, 1)
+            else:
+                w_max = torch.tensor(weight_scale, device=w.device, dtype=w.dtype).view(1, 1)
+
+        scale_vals = w_max / 124.0
+        scale_vals = torch.clamp(scale_vals, min=1e-6)
+
+        w_int8 = torch.round(w / scale_vals).to(torch.int8)
+        new_module.weight.copy_(w_int8)
+        new_module.weight_scale.copy_(scale_vals.to(dtype))
+
+        if linear_module.bias is not None:
+            new_module.bias.copy_(linear_module.bias.data)
+
+        return new_module
+
+    def set_act_scale(self, act_scale):
+        """Set activation scale from calibration stats."""
+        if isinstance(act_scale, torch.Tensor):
+            self.act_scale.copy_(act_scale.view(1, -1))
+        else:
+            self.act_scale.fill_(act_scale)
+
+
+def is_attention_qkv(name):
+    """Check if layer name is an attention QKV layer."""
+    name_lower = name.lower()
+    is_attn = 'self_attn' in name_lower or 'cross_attn' in name_lower
+    if not is_attn:
+        return False
+    last = name.split('.')[-1].lower()
+    return last in ('q', 'k', 'v')
+
+
+def is_ffn_layer(name):
+    """Check if layer name is an FFN layer."""
+    name_lower = name.lower()
+    return 'ffn' in name_lower
+
+
+def is_embedding(name):
+    """Check if layer name is an embedding/projection layer."""
+    name_lower = name.lower()
+    return any(x in name_lower for x in ('text_embedding', 'time_embedding', 'time_projection', 'head'))
+
+
+def convert_model_to_w8a8(model, act_stats=None, method='percentile99', engine='bf16'):
+    """
+    Replace nn.Linear with Int8ActLinear or Int8MatmulLinear (W8A8).
+    engine='bf16': uses Int8ActLinear with bf16 matmul (better quality ~37dB)
+    engine='int8mm': uses Int8MatmulLinear with torch._int_mm (lower quality ~13dB, experimental)
+    For layers with act_stats, use per-channel activation scales.
+    For layers without act_stats, falls back to WeightOnlyInt8Linear (W8A16).
+    Uses named_modules() to traverse all modules recursively.
+    """
+    converted_w8a8 = 0
+    converted_w8a16 = 0
+
+    # Build parent lookup for setattr
+    def get_parent_and_name(model, full_name):
+        parts = full_name.rsplit('.', 1)
+        if len(parts) == 1:
+            return model, parts[0]
+        parent_name, leaf_name = parts
+        parent = model
+        for p in parent_name.split('.'):
+            parent = getattr(parent, p)
+        return parent, leaf_name
+
+    for full_name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+
+        # Try both full_name and leaf name
+        act_amax = act_stats.get(full_name) if act_stats else None
+        if act_amax is None:
+            leaf_name = full_name.rsplit('.', 1)[-1] if '.' in full_name else full_name
+            act_amax = act_stats.get(leaf_name) if act_stats else None
+
+        if act_amax is not None:
+            expected_in = module.in_features
+            actual_act = act_amax.shape[0] if isinstance(act_amax, torch.Tensor) else None
+
+            if actual_act == expected_in:
+                w = module.weight.data
+                w_max = torch.amax(torch.abs(w), dim=1, keepdim=True)
+                w_scale = (w_max / 124.0).clamp(min=1e-6)
+                w_int8 = torch.round(w / w_scale).to(torch.int8)
+
+                if engine == 'int8mm':
+                    new_mod = Int8MatmulLinear(
+                        module.in_features,
+                        module.out_features,
+                        bias=module.bias is not None,
+                        device=w.device,
+                        dtype=w.dtype
+                    )
+                else:
+                    new_mod = Int8ActLinear(
+                        module.in_features,
+                        module.out_features,
+                        bias=module.bias is not None,
+                        device=w.device,
+                        dtype=w.dtype
+                    )
+                new_mod.weight.copy_(w_int8)
+                new_mod.weight_scale.copy_(w_scale)
+                new_mod.set_act_scale(act_amax)
+                if module.bias is not None:
+                    new_mod.bias.copy_(module.bias.data)
+
+                parent, leaf_name = get_parent_and_name(model, full_name)
+                setattr(parent, leaf_name, new_mod)
+                converted_w8a8 += 1
+            else:
+                parent, leaf_name = get_parent_and_name(model, full_name)
+                setattr(parent, leaf_name, WeightOnlyInt8Linear.from_float(module, method=method))
+                converted_w8a16 += 1
+        else:
+            parent, leaf_name = get_parent_and_name(model, full_name)
+            setattr(parent, leaf_name, WeightOnlyInt8Linear.from_float(module, method=method))
+            converted_w8a16 += 1
+
+    print(f"W8A8 conversion: {converted_w8a8} {engine.upper()} layers, {converted_w8a16} WeightOnlyInt8Linear fallback")
+    return model

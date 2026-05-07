@@ -130,9 +130,16 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
     parser.add_argument(
         '--quantize_mode',
         type=str,
-        choices=['None', 'W8A16', 'W8A8_SmoothQuant'],
+        choices=['None', 'W8A16', 'W8A8_SmoothQuant', 'W8A8'],
         default='None',
-        help='Quantization mode for the DiT model. "None": standard precision. "W8A16": 8-bit weights, 16-bit activations. "W8A8_SmoothQuant": 8-bit weights and activations (requires calibration). (default: None)'
+        help='Quantization mode for the DiT model. "None": standard precision. "W8A16": 8-bit weights, 16-bit activations. "W8A8_SmoothQuant": 8-bit weights and activations with SmoothQuant migration. "W8A8": 8-bit weights and activations without migration (requires calibration). (default: None)'
+    )
+    parser.add_argument(
+        '--w8a8_engine',
+        type=str,
+        choices=['bf16', 'int8mm'],
+        default='bf16',
+        help='W8A8 inference engine when quantize_mode is "W8A8". "bf16": uses Int8ActLinear with bf16 matmul (slower but better quality ~37dB). "int8mm": uses Int8MatmulLinear with torch._int_mm (faster but lower quality ~13dB, experimental). (default: bf16)'
     )
     parser.add_argument(
         '--ckpt_path',
@@ -576,7 +583,8 @@ def main():
         dtype=dtype,
         vae_model=args.vae_model,
         quantize_mode=args.quantize_mode,
-        ckpt_path=args.ckpt_path
+        ckpt_path=args.ckpt_path,
+        w8a8_engine=args.w8a8_engine
     )
     
     # ==========================================================================

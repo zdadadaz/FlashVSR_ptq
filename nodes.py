@@ -230,24 +230,31 @@ def log_resource_usage(prefix="Resource Usage", end="\n", in_place=False):
 # FIX 5 & 9: VRAM Estimation, Pre-Flight Resource Check & Settings Recommender
 # Calculate approximate VRAM requirements and provide optimal settings
 # =============================================================================
-def estimate_vram_usage(width, height, num_frames, scale, tiled_vae=False, tiled_dit=False, 
-                         chunk_size=0, mode="full"):
+def estimate_vram_usage(width, height, num_frames, scale, tiled_vae=False, tiled_dit=False,
+                         chunk_size=0, mode="full", quantize_mode="None"):
     """
     Estimate approximate VRAM usage for the given video parameters.
     Returns estimated VRAM in GB. Enhanced to consider chunk_size and mode.
-    
+
     =============================================================================
     FIX: Accurate VRAM Estimation with Safety Factor
     =============================================================================
     Previous estimates were ~4.5GB when actual usage was ~15GB.
     This was because we ignored:
     - Intermediate Activations: PyTorch stores outputs for every layer
-    - VAE Upscaling: VAE decoding expands data significantly  
+    - VAE Upscaling: VAE decoding expands data significantly
     - Workspace Memory: CUDA context overhead
-    
+
     Solution: Apply Safety_Factor = 4.0 to the raw tensor calculations
     to account for these overheads.
     """
+    # Quantization memory savings factor
+    if quantize_mode == "W8A16":
+        quant_factor = 0.65  # Weight-only int8: ~35% memory savings
+    elif quantize_mode in ("W8A8", "W8A8_SmoothQuant"):
+        quant_factor = 0.45  # int8 weights+activations: ~55% memory savings
+    else:
+        quant_factor = 1.0  # No quantization
     # Safety factor to account for intermediate activations, VAE upscaling overhead,
     # and CUDA workspace memory. Empirically determined from observed ~15GB actual
     # usage when estimates were ~4.5GB.
@@ -291,20 +298,26 @@ def estimate_vram_usage(width, height, num_frames, scale, tiled_vae=False, tiled
         attention_gb *= 0.3  # Tiling reduces peak attention memory
     if tiled_vae:
         vae_decode_gb *= 0.4  # Tiling reduces peak VAE memory
-    
-    total_estimated = base_model_gb + input_tensor_gb + total_latent_gb + attention_gb + vae_decode_gb
+
+    # Quantization only affects DiT (not VAE), so apply factor to DiT-related memory
+    # DiT-related: base_model_gb (partially) + attention_gb + total_latent_gb
+    dit_related_gb = base_model_gb * 0.6 + attention_gb + total_latent_gb
+    other_gb = base_model_gb * 0.4 + input_tensor_gb + vae_decode_gb
+
+    dit_related_gb *= quant_factor  # Apply quantization savings to DiT memory
+    total_estimated = dit_related_gb + other_gb
     return total_estimated
 
 
-def get_optimal_settings(width, height, num_frames, scale, available_vram_gb, mode="full"):
+def get_optimal_settings(width, height, num_frames, scale, available_vram_gb, mode="full", quantize_mode="None"):
     """
     Calculate optimal settings (chunk_size, resize_factor, tiling) based on VRAM.
-    
+
     Returns dict with recommended settings.
     """
     # Target VRAM usage: 85% of available to leave headroom
     target_vram = available_vram_gb * 0.85
-    
+
     # Start with default settings
     recommended = {
         "chunk_size": 0,  # 0 = process all at once
@@ -313,53 +326,53 @@ def get_optimal_settings(width, height, num_frames, scale, available_vram_gb, mo
         "tiled_dit": False,
         "warning": None
     }
-    
+
     # Test current settings
-    estimated = estimate_vram_usage(width, height, num_frames, scale, 
-                                     tiled_vae=False, tiled_dit=False, 
-                                     chunk_size=0, mode=mode)
-    
+    estimated = estimate_vram_usage(width, height, num_frames, scale,
+                                     tiled_vae=False, tiled_dit=False,
+                                     chunk_size=0, mode=mode, quantize_mode=quantize_mode)
+
     if estimated <= target_vram:
         # Settings are fine
         return recommended
-    
+
     # Try enabling tiled VAE first (least impact on quality)
     estimated_tiled_vae = estimate_vram_usage(width, height, num_frames, scale,
                                                tiled_vae=True, tiled_dit=False,
-                                               chunk_size=0, mode=mode)
+                                               chunk_size=0, mode=mode, quantize_mode=quantize_mode)
     if estimated_tiled_vae <= target_vram:
         recommended["tiled_vae"] = True
         return recommended
-    
+
     # Try enabling both tiling
     estimated_both_tiled = estimate_vram_usage(width, height, num_frames, scale,
                                                 tiled_vae=True, tiled_dit=True,
-                                                chunk_size=0, mode=mode)
+                                                chunk_size=0, mode=mode, quantize_mode=quantize_mode)
     if estimated_both_tiled <= target_vram:
         recommended["tiled_vae"] = True
         recommended["tiled_dit"] = True
         return recommended
-    
+
     # Need chunking - find optimal chunk size
     recommended["tiled_vae"] = True
     recommended["tiled_dit"] = True
-    
+
     for chunk in [100, 64, 32, 16, 8, 4]:
         if chunk >= num_frames:
             continue
         estimated_chunked = estimate_vram_usage(width, height, num_frames, scale,
                                                  tiled_vae=True, tiled_dit=True,
-                                                 chunk_size=chunk, mode=mode)
+                                                 chunk_size=chunk, mode=mode, quantize_mode=quantize_mode)
         if estimated_chunked <= target_vram:
             recommended["chunk_size"] = chunk
             return recommended
-    
+
     # Still too high - recommend resize factor
     for resize in [0.8, 0.6, 0.5, 0.4, 0.3]:
         new_h, new_w = int(height * resize), int(width * resize)
         estimated_resized = estimate_vram_usage(new_w, new_h, num_frames, scale,
                                                  tiled_vae=True, tiled_dit=True,
-                                                 chunk_size=8, mode=mode)
+                                                 chunk_size=8, mode=mode, quantize_mode=quantize_mode)
         if estimated_resized <= target_vram:
             recommended["chunk_size"] = 8
             recommended["resize_factor"] = resize
@@ -372,8 +385,8 @@ def get_optimal_settings(width, height, num_frames, scale, available_vram_gb, mo
     return recommended
 
 
-def check_resources(width, height, num_frames, scale, chunk_size, resize_factor, 
-                    tiled_vae, tiled_dit, mode="full"):
+def check_resources(width, height, num_frames, scale, chunk_size, resize_factor,
+                    tiled_vae, tiled_dit, mode="full", quantize_mode="None"):
     """
     =============================================================================
     FIX 9: Pre-Flight Resource Calculator
@@ -428,15 +441,15 @@ def check_resources(width, height, num_frames, scale, chunk_size, resize_factor,
     result["estimated_vram_gb"] = estimate_vram_usage(
         effective_w, effective_h, num_frames, scale,
         tiled_vae=tiled_vae, tiled_dit=tiled_dit,
-        chunk_size=chunk_size, mode=mode
+        chunk_size=chunk_size, mode=mode, quantize_mode=quantize_mode
     )
-    
+
     # Check if OOM likely
     if result["estimated_vram_gb"] > result["available_vram_gb"] * VRAM_OOM_THRESHOLD:
         result["will_oom"] = True
         result["recommended_settings"] = get_optimal_settings(
-            effective_w, effective_h, num_frames, scale, 
-            result["available_vram_gb"], mode
+            effective_w, effective_h, num_frames, scale,
+            result["available_vram_gb"], mode, quantize_mode
         )
     
     # Build message
@@ -463,12 +476,12 @@ def check_resources(width, height, num_frames, scale, chunk_size, resize_factor,
 
 
 def log_preflight_check(width, height, num_frames, scale, chunk_size, resize_factor,
-                         tiled_vae, tiled_dit, mode="full"):
+                         tiled_vae, tiled_dit, mode="full", quantize_mode="None"):
     """
     Log pre-flight resource check results.
     """
     result = check_resources(width, height, num_frames, scale, chunk_size, resize_factor,
-                              tiled_vae, tiled_dit, mode)
+                              tiled_vae, tiled_dit, mode, quantize_mode)
     
     log("=" * 60, message_type='info')
     log("PRE-FLIGHT RESOURCE CHECK", message_type='info', icon="🔍")
@@ -1285,12 +1298,12 @@ def process_chunk(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, t
 
     return final_output[:frames.shape[0], :, :, :]
 
-def flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0, mode="full", context_pad=0):
+def flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0, mode="full", context_pad=0, quantize_mode="None"):
     """
     =============================================================================
     FIX 9 & 10: Unified Processing Pipeline with Pre-Flight Check
     =============================================================================
-    
+
     Main FlashVSR processing function.
     - FIX 4: Lossless Resize - Use NEAREST for integer scaling factors
     - FIX 5: VRAM Advisory Logging with 95% threshold
@@ -1308,8 +1321,8 @@ def flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_
     # FIX 9: Pre-Flight Resource Check (BEFORE loading heavy models/processing)
     # ==========================================================================
     preflight_result = log_preflight_check(
-        frames.shape[2], frames.shape[1], frames.shape[0], scale, chunk_size, resize_factor, 
-        tiled_vae, tiled_dit, mode=mode
+        frames.shape[2], frames.shape[1], frames.shape[0], scale, chunk_size, resize_factor,
+        tiled_vae, tiled_dit, mode=mode, quantize_mode=quantize_mode
     )
     
     # If pre-flight check suggests OOM, optionally apply recommended settings
@@ -1428,6 +1441,12 @@ def flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_
                     elif not current_tiled_dit:
                         log("Auto-enabling Tiled DiT to prevent OOM (override)...", message_type='info', icon="🛡️")
                         current_tiled_dit = True
+                    elif not unload_dit:
+                        log("Auto-enabling unload_dit to prevent OOM (offload DiT before VAE decode)...", message_type='info', icon="🛡️")
+                        unload_dit = True
+                    elif retry_count <= max_retries:
+                        log("All memory optimizations active. Retrying with clean VRAM...", message_type='info', icon="🧹")
+                        torch.cuda.empty_cache()
                     else:
                         log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="❌")
                         raise e # Cannot recover further
@@ -1439,6 +1458,7 @@ def flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_
         max_retries = 2
         current_tiled_vae = tiled_vae
         current_tiled_dit = tiled_dit
+        final_output_tensor = None
 
         while retry_count <= max_retries:
             try:
@@ -1460,17 +1480,27 @@ def flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_
                 elif not current_tiled_dit:
                     log("Auto-enabling Tiled DiT to prevent OOM (override)...", message_type='info', icon="🛡️")
                     current_tiled_dit = True
+                elif not unload_dit:
+                    log("Auto-enabling unload_dit to prevent OOM (offload DiT before VAE decode)...", message_type='info', icon="🛡️")
+                    unload_dit = True
                 else:
-                    log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="❌")
+                    # All optimizations exhausted, max retries reached
+                    log(f"All memory optimizations active but still OOM. Max retries reached. "
+                        f"(tiled_vae={current_tiled_vae}, tiled_dit={current_tiled_dit}, unload_dit={unload_dit})",
+                        message_type='error', icon="❌")
                     raise e
 
     end_time = time.time()
     total_time = end_time - start_time
     fps = frames.shape[0] / total_time if total_time > 0 else 0
-    
+
     # ==========================================================================
     # FIX 8: Summary logging at end of processing
     # ==========================================================================
+    if final_output_tensor is None:
+        log("ERROR: final_output_tensor is None - all OOM recovery attempts failed", message_type='error', icon="❌")
+        raise RuntimeError("Processing failed: unable to generate output due to insufficient VRAM even with all optimizations enabled")
+
     log("=" * 60, message_type='info')
     log("PROCESSING SUMMARY", message_type='finish', icon="📊")
     log(f"Total Processing Time: {total_time:.2f}s ({fps:.2f} FPS)", message_type='info', icon="⏱️")

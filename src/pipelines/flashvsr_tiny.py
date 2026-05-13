@@ -534,7 +534,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                             cur_frames.to(device=self.device),
                             cur_LQ_frame,
                             clip_range=(-1, 1),
-                            chunk_size=16,
+                            chunk_size=None,
                             method=color_fix_method
                         ).to('cpu') # Ensure back to CPU
                 except:

@@ -139,9 +139,10 @@ def generate_draft_block_mask(batch_size, nheads, seqlen,
     local_attn_mask = local_attn_mask.unsqueeze(1).unsqueeze(0).repeat(repeat_len, 1, repeat_num, 1)
     local_attn_mask = rearrange(local_attn_mask, 'x a y b -> (x a) (y b)')
     local_attn_mask = local_attn_mask.unsqueeze(0).repeat(repeat_head, 1, 1)
+    mask_bool = local_attn_mask.bool()
     local_attn_mask = local_attn_mask.to(torch.float32)
-    local_attn_mask = local_attn_mask.masked_fill(local_attn_mask == False, -float('inf'))
-    local_attn_mask = local_attn_mask.masked_fill(local_attn_mask == True, 0)
+    local_attn_mask = local_attn_mask.masked_fill(~mask_bool, -float('inf'))
+    local_attn_mask = local_attn_mask.masked_fill(mask_bool, 0.0)
     scores = scores + local_attn_mask
 
     attn_map = torch.softmax(scores, dim=-1)
@@ -194,9 +195,10 @@ def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
     assert scores.shape == local_attn_mask.shape, \
         f"Scores shape {scores.shape} != Mask shape {local_attn_mask.shape}"
     
+    mask_bool = local_attn_mask.bool()
     local_attn_mask = local_attn_mask.to(torch.float32)
-    local_attn_mask = local_attn_mask.masked_fill(local_attn_mask == False, -float('inf'))
-    local_attn_mask = local_attn_mask.masked_fill(local_attn_mask == True, 0)
+    local_attn_mask = local_attn_mask.masked_fill(~mask_bool, -float('inf'))
+    local_attn_mask = local_attn_mask.masked_fill(mask_bool, 0.0)
     scores = scores + local_attn_mask
 
     attn_map = torch.softmax(scores, dim=-1)

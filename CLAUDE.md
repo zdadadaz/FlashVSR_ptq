@@ -123,6 +123,12 @@ For multi-step tasks, state a brief plan:
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
+## 5. Clarify knowledge you are not sure
+
+Don't make up knowledge, when you are not sure about something for coding and planning
+- search online from official document, stackoverflow, github etc.
+- collect the info. you need before you start to code.
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
@@ -131,3 +137,4 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ## keep on track
 1. plan and execution results save into logs with the date and time as filename 
 2. commit and push the modification 
+3. when saving file into logs folder, need to use date and time and pr as filename

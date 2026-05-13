@@ -213,3 +213,5 @@ __marimo__/
 
 models/
 datasets/
+data/
+outputs/

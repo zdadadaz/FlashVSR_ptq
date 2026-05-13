@@ -18,9 +18,10 @@ echo "Settings: Scale=$SCALE, Mode=$MODE"
 # Supports .mp4, .mkv, .avi, .mov
 find "$INPUT_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.avi" -o -name "*.mov" \) | while read -r vid; do
     filename=$(basename "$vid")
-    output_path="$OUTPUT_DIR/${filename%.*}_upscaled_w8a16.mp4"
+    vid2="$OUTPUT_DIR/${filename%.*}_upscaledx4_w8a16.mp4"
+    output_path="$OUTPUT_DIR/${filename%.*}_upscaledx4_w8a16_comb.mp4"
 
-    if [ -f "$output_path" ]; then
+    if [ ! -f "$vid2" ]; then
         echo "------------------------------------------------"
         echo "Skipping: $filename (already exists at $output_path)"
         continue
@@ -29,16 +30,22 @@ find "$INPUT_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name
     echo "------------------------------------------------"
     echo "Processing: $filename"
     
-    python3.10 cli_main.py \
-        --input "$vid" \
-        --output "$output_path" \
-        --scale "$SCALE" \
-        --mode "$MODE" \
-        --quantize_mode W8A16 \
-        --ckpt_path models/FlashVSR-v1.1/diffusion_pytorch_model_w8a16.safetensors \
-        --no_color_fix \
-        --frame_chunk_size 4
+    # up-down
+    # ffmpeg -i "$vid" -i "$vid2" -filter_complex \
+    #         "[0:v]scale=iw*4:ih*4:flags=bicubic[top]; \
+    #         [1:v][top]scale2ref=w=iw:h=ow/mdar:flags=bicubic[bottom][top_ref]; \
+    #         [top_ref][bottom]vstack=inputs=2" \
+    #         -c:v libx264 -crf 18 -preset veryfast "$output_path"
 
+    # left-right
+    ffmpeg -nostdin -y -i "$vid" -i "$vid2" -filter_complex \
+    "[0:v]scale=iw*4:ih*4:flags=bicubic[left]; \
+    [1:v][left]scale2ref=w=oh*mdar:h=ih:flags=bicubic[right][left_ref]; \
+    [left_ref][right]hstack=inputs=2" \
+    -r 30 -vsync 2 \
+    -c:v libx264 -crf 18 -preset veryfast "$output_path"
+
+    # break;
     if [ $? -eq 0 ]; then
         echo "Successfully upscaled: $filename"
     else

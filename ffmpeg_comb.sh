@@ -19,7 +19,7 @@ echo "Settings: Scale=$SCALE, Mode=$MODE"
 find "$INPUT_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.avi" -o -name "*.mov" \) | while read -r vid; do
     filename=$(basename "$vid")
     vid2="$OUTPUT_DIR/${filename%.*}_upscaledx4_w8a16.mp4"
-    output_path="$OUTPUT_DIR/${filename%.*}_upscaledx4_w8a16_comb.mp4"
+    output_path="$OUTPUT_DIR/${filename%.*}_upscaledx4_w8a16_comb_v2.mp4"
 
     if [ ! -f "$vid2" ]; then
         echo "------------------------------------------------"
@@ -37,13 +37,13 @@ find "$INPUT_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name
     #         [top_ref][bottom]vstack=inputs=2" \
     #         -c:v libx264 -crf 18 -preset veryfast "$output_path"
 
-    # left-right
+    # left-right with synchronization and frame rate normalization
     ffmpeg -nostdin -y -i "$vid" -i "$vid2" -filter_complex \
-    "[0:v]scale=iw*4:ih*4:flags=bicubic[left]; \
-    [1:v][left]scale2ref=w=oh*mdar:h=ih:flags=bicubic[right][left_ref]; \
-    [left_ref][right]hstack=inputs=2" \
-    -r 30 -vsync 2 \
-    -c:v libx264 -crf 18 -preset veryfast "$output_path"
+    "[0:v]fps=30,setpts=PTS-STARTPTS,scale=iw*4:ih*4:flags=bicubic[left]; \
+     [1:v]fps=30,setpts=PTS-STARTPTS[right_sync]; \
+     [right_sync][left]scale2ref=w=oh*mdar:h=ih:flags=bicubic[right][left_ref]; \
+     [left_ref][right]hstack=inputs=2,format=yuv420p" \
+    -c:v libx264 -crf 18 -preset veryfast -video_track_timescale 30000 "$output_path"
 
     # break;
     if [ $? -eq 0 ]; then

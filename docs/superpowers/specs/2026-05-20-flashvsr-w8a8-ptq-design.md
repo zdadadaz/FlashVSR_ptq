@@ -19,9 +19,11 @@ FlashVSR is a video super-resolution system using a DiT (Diffusion Transformer) 
 | Component | Weight | Activation |
 |-----------|--------|------------|
 | Weight | **Symmetric** int8 — `scale = absmax(w) / 127`, `zero_point = 0` | N/A |
-| Activation | N/A | **Asymmetric** int8 per-tensor — `scale = (max - min) / 255`, `zero_point = round(-min / scale)` |
+| Activation | N/A | **Asymmetric** int8 per-tensor (default) — `scale = (max - min) / 255`, `zero_point = round(-min / scale)` |
 
-This differs from the previous SmoothQuant approach which migrated activation difficulty to weights via a heuristic alpha. Here we use direct asymmetric activation quantization (standard PTQ).
+**Activation note:** For Ampere/RTX 30-50 series, asymmetric (`zero_point ≠ 0`) has a slight Tensor Core throughput penalty vs symmetric. Default to asymmetric for maximum quality; if PSNR gain is < 0.05dB over symmetric, switch to symmetric (`zero_point = 0`) for full Tensor Core throughput.
+
+This differs from the previous SmoothQuant approach which migrated activation difficulty to weights via a heuristic alpha. Here we use direct asymmetric activation quantization (standard PTQ) with TensorRT handling Q/DQ insertion automatically.
 
 ---
 
@@ -114,7 +116,7 @@ class FlashVSRTQDataset(torch.utils.data.Dataset):
 7. Save calibration cache (JSON): layer_name → {act_scale, zero_point, weight_scale}
 ```
 
-**Note:** No custom QDWrapper inserted into the PyTorch graph. TensorRT's `IInt8EntropyCalibrator2` handles Q/DQ insertion during compilation.
+**Note:** The model stays in pure fp16/bf16 — no custom quantized layer classes inserted in PyTorch. TensorRT's `IInt8EntropyCalibrator2` handles Q/DQ insertion during compilation (Step 4 only collects stats). RMSNorm fold is the only graph modification before export.
 
 ---
 
@@ -123,22 +125,26 @@ class FlashVSRTQDataset(torch.utils.data.Dataset):
 ### Flow
 
 ```
-1. Take calibrated DiT (weights int8, scales stored in buffers)
+1. Load fp16 DiT from safetensors checkpoint (pure fp16/bf16, no quantization in PyTorch)
    │
-2. Export DiT via torch.export (PyTorch 2.0) or ONNX
+2. Fold RMSNorm's learnable γ and bias into adjacent Linear weights/biases
+   │
+3. Export DiT via torch.export (PyTorch 2.0) or ONNX
    → NOT torch.jit.trace (breaks on dynamic scale buffers)
    │
-3. Create TensorRT IInt8EntropyCalibrator2 wrapping the DOVE DataLoader
+4. Create TensorRT IInt8EntropyCalibrator2 wrapping the DOVE DataLoader
    │
-4. torch_tensorrt.compile(
+5. torch_tensorrt.compile(
        model=exported_dit,
-       inputs=[trt.Input((B, T, C, H, W))],
+       inputs=[trt.Input((B, T, 16, H, W))],   # (B, T, C, H, W) — explicit 16 channels
        enabled_precisions={torch.int8},
        ptq_calibrator=calibrator,
    )
    │
-5. Save TensorRT engine (.engine or .pt)
+6. Save TensorRT engine (.engine)
 ```
+
+**No pre-quantization in PyTorch.** The DiT remains fp16/bf16 throughout — weights stay float. TensorRT's calibrator collects activation statistics during compilation, then inserts Q/DQ nodes and quantizes weights internally. This ensures TensorRT sees a clean graph and can apply optimal fusion.
 
 ### VAE Handling
 
@@ -155,72 +161,75 @@ VAE is NOT compiled into the TensorRT engine. It remains as a separate PyTorch b
 
 | File | Purpose |
 |------|---------|
-| `src/models/quantization/ptq_w8a8.py` | W8A8 quantized layer classes (SymmetricWeightLinear, AsymmetricActLinear, QuantizedConv3d) |
-| `src/models/quantization/rmsnorm_fold.py` | Fold RMSNorm γ/bias into Linear weights |
+| `src/models/quantization/rmsnorm_fold.py` | Fold RMSNorm γ/bias into Linear/Conv weights |
 | `scripts/ptq/calibrator_w8a8.py` | CalibrationDataLoader, ActivationCollector, calibration run |
-| `scripts/ptq/convert_w8a8.py` | Load checkpoint, fold RMSNorm, quantize weights, save cache |
 | `scripts/ptq/compile_trt_w8a8.py` | torch.export → TensorRT compile with calibrator |
+
+**Note:** No custom W8A8 layer classes (e.g. `AsymmetricActLinear`) are inserted into the PyTorch graph. Quantization happens entirely inside TensorRT during compilation. The existing `src/models/quantization/ptq.py` (`SymmetricWeightLinear`, `AsymmetricActLinear`) is kept as a standalone reference for native-PyTorch fallback only.
 
 ### Modified Files
 
 | File | Change |
 |------|--------|
-| `nodes.py` | Add `quantize_mode="W8A8_PTQ"` option that loads a pre-calibrated TRT engine instead of running fp16 DiT |
+| `nodes.py` | Add `quantize_mode="W8A8_PTQ"` option that loads a pre-compiled TRT engine instead of running fp16 DiT |
 | `src/pipelines/flashvsr_full.py` | Add `model_fn_trt()` for TensorRT DiT call path |
 | `cli_main.py` | Add `--quantize_mode W8A8_PTQ --trt_engine PATH` flags |
-
----
-
-## Quantized Layer Classes
-
-### SymmetricWeightLinear (W8A16 — fallback)
-
-Weight: int8 symmetric, activation: bf16 passthrough. Identical to existing `SymmetricWeightLinear` in `ptq.py`.
-
-### AsymmetricActLinear (W8A8)
-
-Weight: int8 symmetric, activation: int8 asymmetric per-tensor.
-```python
-# Scale: act_scale = (max - min) / 255, zero_point = round(-min / act_scale)
-x_int8 = round((x - zero_point) / act_scale)
-y = F.linear(x_int8.float(), weight_int8 * weight_scale, bias)
-```
-
-### QuantizedConv3d (W8A8)
-
-Same pattern as AsymmetricActLinear but for Conv3d:
-```python
-x_int8 = round((x - zero_point) / act_scale)
-y = F.conv3d(x_int8, weight_int8 * weight_scale, bias, ...)
-```
 
 ---
 
 ## RMSNorm Fold Utility
 
 ```python
-def fold_rmsnorm_into_linear(rmsnorm: RMSNorm, linear: nn.Linear) -> nn.Linear:
+def fold_rmsnorm_into_linear(rmsnorm, layer):
     """
-    Fold RMSNorm's learnable gamma (weight) and bias into the adjacent Linear.
-    The dynamic RMS(x) computation is NOT folded — it remains as a runtime op.
-    TensorRT will auto-fuse RMSNorm(pure) + Linear(INT8) into a single kernel.
+    Fold RMSNorm's learnable gamma (weight) and bias into the adjacent Linear or Conv.
+
+    Foldable: gamma (gain) and bias — static, no input dependence
+    NOT foldable: dynamic RMS(x) computation — must remain as runtime op.
+                   TensorRT auto-fuses RMSNorm(pure) + Linear into a single kernel.
+
+    Linear weight shape: (out_features, in_features)
+    → gamma shapes the in_features axis → broadcast over dim=1 (columns)
     """
-    gamma = rmsnorm.weight.data  # (C,)
+    gamma = rmsnorm.weight.data
     bias = rmsnorm.bias.data if rmsnorm.bias is not None else None
 
-    # Fold gamma into linear weight: w_folded = w * gamma.view(1, -1, 1, 1) / rms_val
-    # But we can only fold gamma statically: w_folded = w * gamma.view(...)
-    # rms_val is dynamic, so fold gamma only (not rms)
-    w_folded = linear.weight.data * gamma.view(1, -1, 1, 1)
+    if isinstance(layer, nn.Linear):
+        # gamma acts on in_features (columns of weight matrix)
+        w_folded = layer.weight.data * gamma.view(1, -1)   # (out, in) * (1, in) → (out, in)
+        new_layer = nn.Linear(layer.in_features, layer.out_features, bias=layer.bias is not None)
+        new_layer.weight.data = w_folded
+        if bias is not None and layer.bias is not None:
+            new_layer.bias.data = layer.bias.data + bias
+        elif bias is not None:
+            new_layer.bias = nn.Parameter(bias.clone())
 
-    new_linear = nn.Linear(linear.in_features, linear.out_features, bias=linear.bias is not None)
-    new_linear.weight.data = w_folded
-    if bias is not None and linear.bias is not None:
-        new_linear.bias.data = linear.bias.data + bias
-    elif bias is not None:
-        new_linear.bias = nn.Parameter(bias.clone())
+    elif isinstance(layer, nn.Conv2d):
+        # gamma acts on in_channels (dim=1 of weight [out_c, in_c, kH, kW])
+        w_folded = layer.weight.data * gamma.view(1, -1, 1, 1)
+        new_layer = nn.Conv2d(layer.in_channels, layer.out_channels, layer.kernel_size,
+                              stride=layer.stride, padding=layer.padding, dilation=layer.dilation,
+                              groups=layer.groups, bias=layer.bias is not None,
+                              padding_mode=layer.padding_mode)
+        new_layer.weight.data = w_folded
+        if bias is not None and layer.bias is not None:
+            new_layer.bias.data = layer.bias.data + bias
+        elif bias is not None:
+            new_layer.bias = nn.Parameter(bias.clone())
 
-    return new_linear
+    elif isinstance(layer, nn.Conv3d):
+        # gamma acts on in_channels (dim=1 of weight [out_c, in_c, kT, kH, kW])
+        w_folded = layer.weight.data * gamma.view(1, -1, 1, 1, 1)
+        new_layer = nn.Conv3d(layer.in_channels, layer.out_channels, layer.kernel_size,
+                              stride=layer.stride, padding=layer.padding, dilation=layer.dilation,
+                              groups=layer.groups, bias=layer.bias is not None)
+        new_layer.weight.data = w_folded
+        if bias is not None and layer.bias is not None:
+            new_layer.bias.data = layer.bias.data + bias
+        elif bias is not None:
+            new_layer.bias = nn.Parameter(bias.clone())
+
+    return new_layer
 ```
 
 ---
@@ -228,10 +237,10 @@ def fold_rmsnorm_into_linear(rmsnorm: RMSNorm, linear: nn.Linear) -> nn.Linear:
 ## Verification Plan
 
 1. **Calibration:** `python scripts/ptq/calibrator_w8a8.py --input_ckpt model.safetensors --output_cache cache.json --samples 320`
-2. **Conversion:** `python scripts/ptq/convert_w8a8.py --input_ckpt model.safetensors --calibration_cache cache.json --output_ptq model_w8a8.pt`
-3. **TRT Compile:** `python scripts/ptq/compile_trt_w8a8.py --input_ptq model_w8a8.pt --output_engine model.trt`
-4. **Inference:** `python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 2 --quantize_mode W8A8_PTQ --trt_engine model.trt`
-5. **Quality check:** Compare PSNR/SSIM vs bf16 baseline on test videos
+2. **TRT Compile:** `python scripts/ptq/compile_trt_w8a8.py --input_ckpt model.safetensors --calibration_cache cache.json --output_engine model.trt`
+   - This single step: loads fp16 DiT → folds RMSNorm → runs torch.export → compiles with TensorRT calibrator → saves .engine
+3. **Inference:** `python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 2 --quantize_mode W8A8_PTQ --trt_engine model.trt`
+4. **Quality check:** Compare PSNR/SSIM vs bf16 baseline on test videos
 
 ---
 

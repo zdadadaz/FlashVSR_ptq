@@ -136,7 +136,9 @@ class FlashVSRTQDataset(torch.utils.data.Dataset):
    │
 5. torch_tensorrt.compile(
        model=exported_dit,
-       inputs=[trt.Input((B, T, 16, H, W))],   # (B, T, C, H, W) — explicit 16 channels
+       inputs=[trt.Input((B, T, 16, H, W), dtype=trt.float16,
+              shape_ranges=[((1, 1, 16, 128, 128), (4, 16, 16, 512, 512), (8, 64, 16, 2048, 2048)])],
+       # T: 1-64, H/W: 128-2048 — dynamic dims to handle variable video resolutions
        enabled_precisions={torch.int8},
        ptq_calibrator=calibrator,
    )
@@ -145,6 +147,8 @@ class FlashVSRTQDataset(torch.utils.data.Dataset):
 ```
 
 **No pre-quantization in PyTorch.** The DiT remains fp16/bf16 throughout — weights stay float. TensorRT's calibrator collects activation statistics during compilation, then inserts Q/DQ nodes and quantizes weights internally. This ensures TensorRT sees a clean graph and can apply optimal fusion.
+
+**Dynamic shapes:** T (frames), H/W (resolution) are declared as dynamic ranges in `trt.Input` so a single compiled engine handles variable video sizes without recompilation. B (batch) is typically fixed at 1 for streaming video.
 
 ### VAE Handling
 
@@ -188,11 +192,25 @@ def fold_rmsnorm_into_linear(rmsnorm, layer):
     NOT foldable: dynamic RMS(x) computation — must remain as runtime op.
                    TensorRT auto-fuses RMSNorm(pure) + Linear into a single kernel.
 
+    Important: WanModel's RMSNorm typically has elementwise_affine=True but bias=None
+    (standard DiT practice). If bias is present and non-zero, it must be propagated
+    through the layer's weight (e.g. for Linear: bias @ weight.T). Since this is rare
+    in modern DiTs, we assert bias is None or all-zeros rather than implementing the
+    full matrix multiply. If non-zero bias is encountered, only fold gamma.
+
     Linear weight shape: (out_features, in_features)
     → gamma shapes the in_features axis → broadcast over dim=1 (columns)
     """
     gamma = rmsnorm.weight.data
     bias = rmsnorm.bias.data if rmsnorm.bias is not None else None
+
+    # If bias is non-trivial, only fold gamma (skip bias folding to avoid
+    # incorrect results without implementing full weight @ bias.T reshape)
+    if bias is not None and not (bias.abs() < 1e-6).all():
+        import warnings
+        warnings.warn(f"RMSNorm bias is non-zero ({bias.abs().max():.6f}), folding gamma only. "
+                      "Bias folding requires weight @ bias.T — implement if needed.")
+        bias = None
 
     if isinstance(layer, nn.Linear):
         # gamma acts on in_features (columns of weight matrix)

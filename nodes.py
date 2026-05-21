@@ -777,7 +777,15 @@ def create_feather_mask(size, overlap):
     
     return mask
 
-def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode="None", ckpt_path=None, w8a8_engine="bf16"):
+def load_trt_engine(engine_path):
+    """Load a pre-compiled TensorRT engine for W8A8_PTQ mode."""
+    if not os.path.exists(engine_path):
+        raise RuntimeError(f"TRT engine not found: {engine_path}")
+    log(f"Loading TRT engine from {engine_path}...", message_type='info', icon='🗜️')
+    engine = torch.jit.load(engine_path)
+    return engine
+
+def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode="None", ckpt_path=None, w8a8_engine="bf16", trt_engine_path=None):
     """
     Initialize FlashVSR pipeline with specified model and VAE type.
     """
@@ -829,9 +837,11 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
     prompt_path = os.path.join(current_dir, "posi_prompt.pth")
     
     mm = ModelManager(torch_dtype=dtype, device="cpu")
-    
-    # Handle quantized DiT model loading manually if needed
-    if "w8a16" in ckpt_path.lower():
+
+    # Handle pre-quantized DiT model loading manually if needed
+    # Check for both W8A16 and W8A8 quantized checkpoints
+    is_quantized_ckpt = "w8a16" in ckpt_path.lower() or "w8a8" in ckpt_path.lower()
+    if is_quantized_ckpt:
         log(f"Manual loading detected for quantized DiT: {ckpt_path}", message_type='info', icon="🔍")
         # Instantiate model structure
         try:
@@ -931,7 +941,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
         log(f"Loaded TCDecoder for Full Mode (official FlashVSR approach)", message_type='info', icon="✅")
     else:
         # For non-full modes, we still need to load VAE to the model manager if not manually handled
-        if not ("w8a16" in ckpt_path.lower()):
+        if not is_quantized_ckpt:
             mm.load_models([ckpt_path, vae_path])
             
         if mode == "tiny":
@@ -952,10 +962,10 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
     pipe.to(device, dtype=dtype)
     
     if quantize_mode == "W8A16":
-        # Check if the loaded checkpoint was already quantized (filename contains w8a16)
+        # Check if the loaded checkpoint was already quantized (filename contains w8a16 or w8a8)
         # If it was, we already handled structural conversion and weight loading in the manual load block above.
-        if "w8a16" in ckpt_path.lower():
-            log(f"W8A16 model already active from pre-quantized checkpoint.", message_type='info', icon="🗜️")
+        if "w8a16" in ckpt_path.lower() or "w8a8" in ckpt_path.lower():
+            log(f"Quantized model already active from pre-quantized checkpoint.", message_type='info', icon="🗜️")
         else:
             try:
                 from .src.models.quantization.quant import convert_model_to_w8a16
@@ -986,22 +996,36 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
 
     elif quantize_mode == "W8A8":
         # W8A8 without SmoothQuant migration — uses Int8ActLinear
-        try:
-            from .src.models.quantization.quant import convert_model_to_w8a8
-            from .src.models.quantization.smoothquant import inject_observers, collect_activation_stats
-        except ImportError:
-            from src.models.quantization.quant import convert_model_to_w8a8
-            from src.models.quantization.smoothquant import inject_observers, collect_activation_stats
-        log("Running W8A8 calibration (non-SmoothQuant)...", message_type='info', icon="🗜️")
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        dataset_path = os.path.join(current_dir, "datasets", "test")
-        act_stats = collect_activation_stats(
-            pipe.denoising_model(), dataset_path, pipe,
-            num_videos=3, frames_per_video=4
-        )
-        log(f"Calibration complete: collected stats from {len(act_stats)} layers", message_type='info', icon="✅")
-        log(f"Applying W8A8 to DiT model using {w8a8_engine.upper()} engine...", message_type='info', icon="🗜️")
-        convert_model_to_w8a8(pipe.denoising_model(), act_stats, method='percentile99', engine=w8a8_engine)
+        # If checkpoint is already quantized (W8A8), skip calibration
+        if is_quantized_ckpt:
+            log(f"W8A8 model already active from pre-quantized checkpoint (skip calibration).", message_type='info', icon="🗜️")
+        else:
+            try:
+                from .src.models.quantization.quant import convert_model_to_w8a8
+                from .src.models.quantization.smoothquant import inject_observers, collect_activation_stats
+            except ImportError:
+                from src.models.quantization.quant import convert_model_to_w8a8
+                from src.models.quantization.smoothquant import inject_observers, collect_activation_stats
+            log("Running W8A8 calibration (non-SmoothQuant)...", message_type='info', icon="🗜️")
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            dataset_path = os.path.join(current_dir, "datasets", "test")
+            act_stats = collect_activation_stats(
+                pipe.denoising_model(), dataset_path, pipe,
+                num_videos=3, frames_per_video=4
+            )
+            log(f"Calibration complete: collected stats from {len(act_stats)} layers", message_type='info', icon="✅")
+            log(f"Applying W8A8 to DiT model using {w8a8_engine.upper()} engine...", message_type='info', icon="🗜️")
+            convert_model_to_w8a8(pipe.denoising_model(), act_stats, method='percentile99', engine=w8a8_engine)
+
+    elif quantize_mode == "W8A8_PTQ":
+        # Load pre-compiled TensorRT INT8 engine for DiT
+        # VAE stays bf16, DiT is from TRT engine (not model manager)
+        log("W8A8_PTQ mode: DiT from TRT engine, VAE from bf16...", message_type='info', icon='🗜️')
+        # Load TRT engine if provided
+        if trt_engine_path is not None:
+            pipe.trt_engine_ = load_trt_engine(trt_engine_path)
+        else:
+            log("Warning: W8A8_PTQ mode without trt_engine_path - DiT not loaded!", message_type='warning', icon='⚠️')
 
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv(prompt_path=prompt_path)

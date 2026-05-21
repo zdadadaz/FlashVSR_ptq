@@ -70,7 +70,7 @@ def load_dit_with_rmsnorm_fold(checkpoint_path):
     model = WanModel(
         dim=1536,
         eps=1e-5,
-        ffn_dim=6144,
+        ffn_dim=8960,
         freq_dim=256,
         in_dim=16,
         num_heads=12,

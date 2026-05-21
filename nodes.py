@@ -1579,7 +1579,7 @@ class FlashVSRNodeInitPipe:
                     "default": "sparse_sage_attention",
                     "tooltip": 'Attention mechanism backend. "sparse_sage"/"block_sparse" use efficient sparse attention. "flash_attention_2"/"sdpa" use dense attention (slower, more VRAM).'
                 }),
-                "quantize_mode": (["None", "W8A16", "W8A8_SmoothQuant"], {
+                "quantize_mode": (["None", "W8A16", "W8A8_SmoothQuant", "W8A8_PTQ"], {
                     "default": "None",
                     "tooltip": "Quantization mode to reduce VRAM. W8A16 dynamically halves weight VRAM. W8A8 (planned) quantizes both weights and activations."
                 }),

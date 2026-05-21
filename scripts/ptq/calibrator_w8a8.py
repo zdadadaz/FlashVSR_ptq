@@ -10,6 +10,7 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -184,14 +185,17 @@ def run_calibration(
 
     model.eval()
     with torch.no_grad():
-        for batch in loader:
-            # Pass through model - actual model forward needed
-            # For now, just simulate with dummy forward
+        for batch in tqdm(loader, desc="Calibration"):
+            # Pass through model - collect activation statistics
+            latents = batch.latents.cuda().unsqueeze(1)  # (B, T=1, C, H, W)
+            timesteps = batch.timesteps.cuda()
+            contexts = batch.contexts.cuda()
+
             try:
-                # Try actual model forward
-                pass
-            except Exception:
-                pass
+                model(latents, timesteps, contexts)
+            except Exception as e:
+                print(f"  Warning: forward pass error: {e}")
+                continue
 
     scales = collector.compute_scales()
     collector.remove_hooks()

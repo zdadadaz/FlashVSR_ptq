@@ -130,9 +130,9 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
     parser.add_argument(
         '--quantize_mode',
         type=str,
-        choices=['None', 'W8A16', 'W8A8_SmoothQuant', 'W8A8'],
+        choices=['None', 'W8A16', 'W8A8_SmoothQuant', 'W8A8', 'W8A8_PTQ'],
         default='None',
-        help='Quantization mode for the DiT model. "None": standard precision. "W8A16": 8-bit weights, 16-bit activations. "W8A8_SmoothQuant": 8-bit weights and activations with SmoothQuant migration. "W8A8": 8-bit weights and activations without migration (requires calibration). (default: None)'
+        help='Quantization mode for the DiT model. "None": standard precision. "W8A16": 8-bit weights, 16-bit activations. "W8A8_SmoothQuant": 8-bit weights and activations with SmoothQuant migration. "W8A8": 8-bit weights and activations without migration (requires calibration). "W8A8_PTQ": uses pre-compiled TensorRT engine for W8A8 inference. (default: None)'
     )
     parser.add_argument(
         '--w8a8_engine',
@@ -146,6 +146,12 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         type=str,
         default=None,
         help='Path to a custom DiT checkpoint (e.g., a pre-quantized model).'
+    )
+    parser.add_argument(
+        '--trt_engine',
+        type=str,
+        default=None,
+        help='Path to pre-compiled TensorRT .engine file for W8A8_PTQ mode.'
     )
 
     # ==========================================================================
@@ -584,7 +590,8 @@ def main():
         vae_model=args.vae_model,
         quantize_mode=args.quantize_mode,
         ckpt_path=args.ckpt_path,
-        w8a8_engine=args.w8a8_engine
+        w8a8_engine=args.w8a8_engine,
+        trt_engine_path=args.trt_engine
     )
     
     # ==========================================================================

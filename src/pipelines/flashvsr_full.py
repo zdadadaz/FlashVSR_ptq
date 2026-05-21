@@ -173,6 +173,7 @@ class FlashVSRFullPipeline(BasePipeline):
         self.use_unified_sequence_parallel = False
         self.prompt_emb_posi = None
         self.ColorCorrector = TorchColorCorrectorWavelet(levels=5)
+        self.trt_engine_ = None  # Set via pipe.trt_engine = load_trt_engine(path)
 
         print(r"""
  ███████╗██╗      █████╗ ███████╗██╗  ██╗██╗   ██╗███████╗█████╗
@@ -252,6 +253,35 @@ class FlashVSRFullPipeline(BasePipeline):
 
     def denoising_model(self):
         return self.dit
+
+    @property
+    def trt_engine(self):
+        return self.trt_engine_
+
+    @trt_engine.setter
+    def trt_engine(self, value):
+        self.trt_engine_ = value
+
+    def model_fn_trt(self, latents, t, context):
+        """
+        Forward pass through TensorRT-compiled DiT engine.
+
+        Args:
+            latents: (B, T, C, H, W) — noisy latent input
+            t: (B,) — timesteps
+            context: (B, 10, 4096) — text embeddings
+
+        Returns:
+            Denoised latents (same shape as input)
+        """
+        if self.trt_engine_ is None:
+            raise RuntimeError("TRT engine not loaded. Set pipe.trt_engine = load_trt_engine(path)")
+        latents = latents.to(device=self.device, dtype=torch.bfloat16)
+        t = t.to(device=self.device)
+        context = context.to(device=self.device, dtype=torch.bfloat16)
+        with torch.no_grad():
+            output = self.trt_engine_(latents, t, context)
+        return output
 
     # -------------------------
     # 新增：显式 KV 预初始化函数

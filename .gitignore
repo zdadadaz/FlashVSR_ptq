@@ -215,3 +215,4 @@ models/
 datasets/
 data/
 outputs/
+*.json

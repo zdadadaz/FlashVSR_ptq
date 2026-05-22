@@ -1,7 +1,6 @@
-"""Test package - mocks ComfyUI modules before any project imports."""
+"""Test configuration for pytest - mocks ComfyUI modules for ptq tests."""
 
 import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
 # Mock ComfyUI modules before any imports from the project

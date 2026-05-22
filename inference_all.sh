@@ -37,7 +37,7 @@ find "$INPUT_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name
         --quantize_mode W8A16 \
         --ckpt_path models/FlashVSR-v1.1/diffusion_pytorch_model_w8a16.safetensors \
         --no_color_fix \
-        --frame_chunk_size 4
+        --frame_chunk_size 30
 
     if [ $? -eq 0 ]; then
         echo "Successfully upscaled: $filename"

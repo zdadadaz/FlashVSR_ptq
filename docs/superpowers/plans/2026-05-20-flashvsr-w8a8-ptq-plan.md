@@ -1243,3 +1243,12 @@ After all tasks complete:
 2. **TRT Compile:** `python scripts/ptq/compile_trt_w8a8.py --input_ckpt models/... --output_engine model.engine`
 3. **Inference:** `python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 2 --quantize_mode W8A8_PTQ --trt_engine model.engine`
 4. **Quality:** Compare PSNR/SSIM vs bf16 baseline on test videos
+
+  # 1. Calibration
+  python3.10 scripts/ptq/calibrator_w8a8.py --input_ckpt models/FlashVSR-v1.1/diffusion_pytorch_model_streaming_dmd.safetensors --output_cache ./calibration_cache.json --samples 320
+
+  # 2. TRT Compile
+  python scripts/ptq/compile_trt_w8a8.py --input_ckpt models/FlashVSR-v1.1/diffusion_pytorch_model_streaming_dmd.safetensors --output_engine ./model.engine --calibration_cache ./calibration_cache.json
+
+  # 3. Inference
+  python3.10 cli_main.py --input data/lowres/city2_1.mp4 --output ./outputs/city2_1_upscaledx4.mp4 --scale 4 --quantize_mode W8A8_PTQ --trt_engine ./model.engine --mode tiny

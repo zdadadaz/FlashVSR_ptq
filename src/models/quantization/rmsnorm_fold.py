@@ -46,12 +46,13 @@ def fold_rmsnorm_into_linear(linear: nn.Linear, rmsnorm: nn.Module) -> nn.Linear
     # Get RMSNorm weight and compute effective scaling
     # For RMSNorm: y = x * rms_weight / sqrt(mean(x^2) + eps)
     # We fold this into linear weights by scaling weight
-    rms_weight = rmsnorm.weight.float()
+    # Use the same dtype as the linear weight to ensure consistency
+    rms_weight = rmsnorm.weight.to(linear.weight.dtype)
 
     # Compute the fold: new_weight = weight * rms_weight
     # Bias is unaffected (RMSNorm doesn't have bias)
     with torch.no_grad():
-        linear.weight.data = linear.weight.data.float() * rms_weight
+        linear.weight.data = linear.weight.data * rms_weight
 
     return linear
 

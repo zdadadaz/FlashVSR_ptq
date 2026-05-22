@@ -4,6 +4,14 @@ Collects activation statistics (min/max) for per-tensor quantization
 using TensorRT-compatible W8A8 calibration.
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to path for src imports
+_project_root = Path(__file__).resolve().parents[2]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
 import argparse
 import json
 import random
@@ -16,6 +24,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+
+from src.models.wan_video_dit import WanModel, sinusoidal_embedding_1d
 
 
 @dataclass
@@ -36,11 +46,13 @@ class FlashVSRTQDataset(Dataset):
         self,
         root: str = "datasets",
         num_samples: int = 320,
-        frame_size: tuple = (24, 24),
+        frame_size: tuple = (64, 64),  # Must be divisible by 16 for window partitioning
+        num_frames: int = 6,  # Must be divisible by 2 for temporal window partitioning (win[0]=2)
     ):
         self.root = Path(root)
         self.num_samples = num_samples
         self.frame_size = frame_size
+        self.num_frames = num_frames
 
         # Try DOVE train set first, fallback to test/UDM10/GT
         self.dove_path = self.root / "train" / "HQ-VSR"
@@ -81,8 +93,12 @@ class FlashVSRTQDataset(Dataset):
             dtype=torch.bfloat16
         )
 
+        # Stack num_frames copies for temporal dimension
+        # Output: (num_frames, C, H, W) = (4, 16, 64, 64)
+        latents = latent.unsqueeze(0).expand(self.num_frames, -1, -1, -1).contiguous()
+
         return CalibrationSample(
-            latents=latent,
+            latents=latents,  # (num_frames, C, H, W)
             timesteps=torch.tensor(
                 [random.choice(self.TIMESTEPS)], dtype=torch.int64
             ),
@@ -161,6 +177,15 @@ class ActivationCollector:
         return scales
 
 
+def collate_calibration_samples(batch):
+    """Collate function to stack CalibrationSample dataclasses into batched tensors."""
+    return {
+        "latents": torch.stack([s.latents for s in batch]),
+        "timesteps": torch.stack([s.timesteps for s in batch]),
+        "contexts": torch.stack([s.contexts for s in batch]),
+    }
+
+
 def run_calibration(
     model: nn.Module,
     dataset: Dataset,
@@ -181,18 +206,89 @@ def run_calibration(
     collector = ActivationCollector(model)
     collector.register_hooks()
 
-    loader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_calibration_samples,
+    )
 
     model.eval()
+    device = next(model.parameters()).device
     with torch.no_grad():
         for batch in tqdm(loader, desc="Calibration"):
-            # Pass through model - collect activation statistics
-            latents = batch.latents.cuda().unsqueeze(1)  # (B, T=1, C, H, W)
-            timesteps = batch.timesteps.cuda()
-            contexts = batch.contexts.cuda()
+            # Dataset returns (B, T, C, H, W) where T=num_frames
+            latents = batch["latents"].to(device).float()  # (B, T, C, H, W)
+            timesteps = batch["timesteps"].to(device).float().squeeze(-1)  # (B,)
+            contexts = batch["contexts"].to(device)  # (B, 10, 4096)
 
             try:
-                model(latents, timesteps, contexts)
+                for i in range(latents.shape[0]):
+                    # Use model_fn_wan_video pattern (same as pipeline)
+                    # Reshape from (T, C, H, W) to (C, T, H, W) for model
+                    x = latents[i].permute(1, 0, 2, 3)  # (C, T, H, W)
+                    x = x.unsqueeze(0)  # (1, C, T, H, W)
+
+                    # Precompute timestep embedding (same as pipeline does)
+                    t = model.time_embedding(
+                        sinusoidal_embedding_1d(model.freq_dim, timesteps[i:i+1])
+                    )
+                    t_mod = model.time_projection(t).unflatten(1, (6, model.dim))
+
+                    # Patchify: x->(B, seq, C), grid_size->(f, h, w)
+                    x, (f, h, w) = model.patchify(x)
+
+                    # RoPE frequencies
+                    win = (2, 8, 8)
+                    freqs = torch.cat([
+                        model.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                        model.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                        model.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+                    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+
+                    seqlen = f // win[0]
+                    local_num = seqlen
+                    window_size = win[0] * h * w // 128
+                    square_num = window_size * window_size
+                    topk = int(square_num * 2.0) - 1
+                    kv_len = int(3.0)
+
+                    # Forward through blocks
+                    for block_id, block in enumerate(model.blocks):
+                        try:
+                            block_out = block(
+                                x, contexts[i:i+1], t_mod, freqs, f, h, w,
+                                local_num, topk,
+                                block_id=block_id,
+                                kv_len=kv_len,
+                                is_full_block=False,
+                                is_stream=True,  # Required for 3-value return
+                                pre_cache_k=None,
+                                pre_cache_v=None,
+                                local_range=9,
+                            )
+                            if isinstance(block_out, tuple):
+                                x, _, _ = block_out
+                            else:
+                                x = block_out
+                        except ValueError:
+                            # Fallback: is_stream=False path (model bug - always expects 3 returns)
+                            block_out = block(
+                                x, contexts[i:i+1], t_mod, freqs, f, h, w,
+                                local_num, topk,
+                                block_id=block_id,
+                                kv_len=kv_len,
+                                is_full_block=False,
+                                is_stream=False,
+                                pre_cache_k=None,
+                                pre_cache_v=None,
+                                local_range=9,
+                            )
+                            if isinstance(block_out, tuple):
+                                x, _, _ = block_out
+                            else:
+                                x = block_out
             except Exception as e:
                 print(f"  Warning: forward pass error: {e}")
                 continue
@@ -241,8 +337,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from src.models.wan_video_dit import WanModel
-
     # Load model from checkpoint
     print(f"Loading model from {args.input_ckpt}")
     if args.input_ckpt.endswith('.safetensors'):
@@ -276,11 +370,25 @@ def main() -> None:
     model.load_state_dict(new_state_dict, strict=False)
     model.eval()
 
+    # Move model to CUDA for calibration
+    if torch.cuda.is_available():
+        model = model.cuda()
+        print("Model moved to CUDA")
+
+        # Initialize cross-attention KV cache with a dummy context
+        # This is required for the model's cross-attention layers to work
+        dummy_context = torch.randn(1, 10, 4096, dtype=torch.float32, device='cuda')
+        if hasattr(model, 'reinit_cross_kv'):
+            model.reinit_cross_kv(dummy_context)
+            print("Cross-attention KV cache initialized")
+    else:
+        print("WARNING: CUDA not available, running on CPU")
+
     # Create dataset
     dataset = FlashVSRTQDataset(
         root=args.dataset,
         num_samples=args.samples,
-        frame_size=(24, 24),
+        frame_size=(64, 64),  # Must be divisible by 16 for window partitioning
     )
     print(f"Created dataset with {len(dataset)} samples")
 

@@ -263,6 +263,129 @@ class FakeQuantLinear(nn.Module):
                 self.act_zero_point.copy_(zero_point)
 
 
+
+# ------------------------------------------------------------------
+# FakeQuant ConvNd — optional quantized convolution layers
+# ------------------------------------------------------------------
+
+class _FakeQuantConvNd(nn.Module):
+    """Common fake-quant QDQ implementation for Conv2d/Conv3d.
+
+    A8W8 semantics match FakeQuantLinear: activations and weights are rounded to
+    true int8 tensors, immediately dequantized to float32, then computed with the
+    normal PyTorch convolution kernel. This is intended for sensitivity analysis
+    (quality/PSNR impact), not accelerated inference.
+    """
+
+    conv_dim = None
+
+    def __init__(self, conv_module: nn.Module, activation_mode: str = "a8", weight_mode: str = "w8"):
+        super().__init__()
+        if weight_mode != "w8":
+            raise ValueError("FakeQuantConv currently supports W8 only")
+        if activation_mode not in ("a8", "a16"):
+            raise ValueError(f"Unsupported activation mode: {activation_mode}")
+
+        self.activation_mode = activation_mode
+        self.weight_mode = weight_mode
+        self.in_channels = conv_module.in_channels
+        self.out_channels = conv_module.out_channels
+        self.kernel_size = conv_module.kernel_size
+        self.stride = conv_module.stride
+        self.padding = conv_module.padding
+        self.dilation = conv_module.dilation
+        self.groups = conv_module.groups
+        self.padding_mode = conv_module.padding_mode
+        # Preserve custom causal padding used by src.models.utils.CausalConv3d.
+        self._causal_padding = tuple(getattr(conv_module, "_padding", ()))
+        # Same layout PyTorch ConvNd uses for non-zero padding modes.
+        self._reversed_padding_repeated_twice = tuple(x for p in reversed(self.padding) for x in (p, p))
+
+        w = conv_module.weight.detach().to(torch.float32)
+        reduce_dims = tuple(range(1, w.dim()))
+        w_max = torch.amax(torch.abs(w), dim=reduce_dims, keepdim=True)
+        w_scale = (w_max / 127.0).clamp(min=1e-6)
+        w_int8 = torch.clamp(torch.round(w / w_scale), -127, 127).to(torch.int8)
+        self.register_buffer("weight_int", w_int8)
+        self.register_buffer("weight_scale", w_scale.to(torch.float32))
+        if conv_module.bias is not None:
+            self.register_buffer("bias", conv_module.bias.detach().to(torch.float32).clone())
+        else:
+            self.register_buffer("bias", None)
+
+    def _qdq_activation(self, x: torch.Tensor) -> torch.Tensor:
+        if self.activation_mode != "a8":
+            return x.to(torch.float32)
+        x_float = x.detach().to(torch.float32)
+        # Per-sample, per-input-channel dynamic scale; reduce spatial/temporal dims.
+        reduce_dims = tuple(d for d in range(x_float.dim()) if d != 1)
+        x_scale = torch.amax(torch.abs(x_float), dim=reduce_dims, keepdim=True).clamp(min=1e-6) / 127.0
+        x_q = torch.clamp(torch.round(x_float / x_scale), -127, 127).to(torch.int8)
+        return x_q.to(torch.float32) * x_scale
+
+    def _dequantize_weight(self, device) -> torch.Tensor:
+        return self.weight_int.to(device=device, dtype=torch.float32) * self.weight_scale.to(device=device, dtype=torch.float32)
+
+
+class FakeQuantConv2d(_FakeQuantConvNd):
+    conv_dim = 2
+
+    @classmethod
+    def from_float(cls, conv_module: nn.Conv2d, activation_mode: str = "a8", weight_mode: str = "w8"):
+        if not isinstance(conv_module, nn.Conv2d):
+            raise TypeError(f"Expected nn.Conv2d, got {type(conv_module)}")
+        return cls(conv_module, activation_mode=activation_mode, weight_mode=weight_mode)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x_fp = self._qdq_activation(x)
+        w_fp = self._dequantize_weight(x.device)
+        if self.padding_mode != "zeros":
+            x_fp = F.pad(x_fp, self._reversed_padding_repeated_twice, mode=self.padding_mode)
+            padding = (0, 0)
+        else:
+            padding = self.padding
+        y = F.conv2d(
+            x_fp.to(torch.float32), w_fp.to(torch.float32),
+            self.bias.to(torch.float32) if self.bias is not None else None,
+            self.stride, padding, self.dilation, self.groups,
+        )
+        return y.to(orig_dtype)
+
+
+class FakeQuantConv3d(_FakeQuantConvNd):
+    conv_dim = 3
+
+    @classmethod
+    def from_float(cls, conv_module: nn.Conv3d, activation_mode: str = "a8", weight_mode: str = "w8"):
+        if not isinstance(conv_module, nn.Conv3d):
+            raise TypeError(f"Expected nn.Conv3d, got {type(conv_module)}")
+        return cls(conv_module, activation_mode=activation_mode, weight_mode=weight_mode)
+
+    def forward(self, x: torch.Tensor, cache_x: torch.Tensor = None) -> torch.Tensor:
+        orig_dtype = x.dtype
+        if self._causal_padding:
+            padding = list(self._causal_padding)
+            if cache_x is not None and padding[4] > 0:
+                cache_x = cache_x.to(x.device)
+                x = torch.cat([cache_x, x], dim=2)
+                padding[4] -= cache_x.shape[2]
+            x = F.pad(x, padding, mode='replicate')
+            conv_padding = (0, 0, 0)
+        else:
+            conv_padding = self.padding
+        x_fp = self._qdq_activation(x)
+        w_fp = self._dequantize_weight(x.device)
+        if self.padding_mode != "zeros" and not self._causal_padding:
+            x_fp = F.pad(x_fp, self._reversed_padding_repeated_twice, mode=self.padding_mode)
+            conv_padding = (0, 0, 0)
+        y = F.conv3d(
+            x_fp.to(torch.float32), w_fp.to(torch.float32),
+            self.bias.to(torch.float32) if self.bias is not None else None,
+            self.stride, conv_padding, self.dilation, self.groups,
+        )
+        return y.to(orig_dtype)
+
 # ------------------------------------------------------------------
 # Model conversion
 # ------------------------------------------------------------------
@@ -501,3 +624,68 @@ def get_all_linear_layers(model) -> list:
         (name, m) for name, m in model.named_modules()
         if isinstance(m, nn.Linear)
     ]
+
+
+def convert_ops_to_fakequant(
+    model,
+    mode: str = "a8w8",
+    op_types=("linear",),
+    prefix: str = "",
+):
+    """Recursively replace selected op types with FakeQuant QDQ modules.
+
+    Args:
+        model: module to mutate in-place.
+        mode: a8w8/a16w8. Conv ops currently support W8 only.
+        op_types: iterable containing any of: linear, conv2d, conv3d.
+        prefix: optional name prefix for logging only.
+    """
+    if mode.startswith("a16"):
+        activation_mode, weight_mode = "a16", mode[3:]
+    elif mode.startswith("a8"):
+        activation_mode, weight_mode = "a8", mode[2:]
+    else:
+        raise ValueError(f"Unsupported fakequant mode: {mode}")
+    if weight_mode != "w8":
+        raise ValueError("Conv/LQ/VAE/TCDecoder op fakequant currently supports W8 modes only")
+
+    op_types = set(op_types or ())
+    converted = {"linear": 0, "conv2d": 0, "conv3d": 0}
+    fallback = 0
+
+    def get_parent_and_name(mod, full_name):
+        parts = full_name.rsplit(".", 1)
+        if len(parts) == 1:
+            return mod, parts[0]
+        parent = mod
+        for p in parts[0].split("."):
+            parent = getattr(parent, p)
+        return parent, parts[1]
+
+    for full_name, module in list(model.named_modules()):
+        if full_name == "":
+            continue
+        kind = None
+        factory = None
+        # Conv3d before Conv2d is not necessary but keeps subclass intent explicit.
+        if "conv3d" in op_types and isinstance(module, nn.Conv3d):
+            kind, factory = "conv3d", FakeQuantConv3d.from_float
+        elif "conv2d" in op_types and isinstance(module, nn.Conv2d):
+            kind, factory = "conv2d", FakeQuantConv2d.from_float
+        elif "linear" in op_types and isinstance(module, nn.Linear):
+            kind = "linear"
+            factory = lambda m, activation_mode, weight_mode: FakeQuantLinear.from_float(
+                m, activation_mode=activation_mode, weight_mode=weight_mode
+            )
+        if kind is None:
+            continue
+        try:
+            new_mod = factory(module, activation_mode=activation_mode, weight_mode=weight_mode)
+            parent, leaf_name = get_parent_and_name(model, full_name)
+            setattr(parent, leaf_name, new_mod)
+            converted[kind] += 1
+        except Exception as e:
+            print(f"  [FakeQuantOps] Failed to convert {prefix + '.' if prefix else ''}{full_name}: {e}")
+            fallback += 1
+    print(f"[FakeQuantOps] {prefix or type(model).__name__}: mode={mode} converted={converted} fallback={fallback}")
+    return model

@@ -143,6 +143,12 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         help='W8A8 inference engine when quantize_mode is "W8A8". "bf16": uses Int8ActLinear with bf16 matmul (slower but better quality ~37dB). "int8mm": uses Int8MatmulLinear with torch._int_mm (faster but lower quality ~13dB, experimental). (default: bf16)'
     )
     parser.add_argument(
+        '--fakequant_extra_scopes',
+        type=str,
+        default='',
+        help='Comma-separated extra modules to fake-quantize for sensitivity runs: wan_vae,tcdecoder,lq_proj_in,dit_conv3d,all. Only active with FakeQuant_* modes; supports A8W8/A16W8 for conv ops.'
+    )
+    parser.add_argument(
         '--ckpt_path',
         type=str,
         default=None,
@@ -592,7 +598,8 @@ def main():
         quantize_mode=args.quantize_mode,
         ckpt_path=args.ckpt_path,
         w8a8_engine=args.w8a8_engine,
-        trt_engine_path=args.trt_engine
+        trt_engine_path=args.trt_engine,
+        fakequant_extra_scopes=args.fakequant_extra_scopes
     )
     
     # ==========================================================================

@@ -785,7 +785,7 @@ def load_trt_engine(engine_path):
     engine = torch.jit.load(engine_path)
     return engine
 
-def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode="None", ckpt_path=None, w8a8_engine="bf16", trt_engine_path=None):
+def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode="None", ckpt_path=None, w8a8_engine="bf16", trt_engine_path=None, fakequant_extra_scopes=""):
     """
     Initialize FlashVSR pipeline with specified model and VAE type.
     """
@@ -864,10 +864,10 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
         log(f"FakeQuant checkpoint detected: {ckpt_path}", message_type='info', icon="🔍")
         try:
             from .src.models.wan_video_dit import WanModel
-            from .src.models.quantization.fakequant import convert_model_to_fakequant
+            from .src.models.quantization.fakequant import convert_model_to_fakequant, convert_ops_to_fakequant
         except ImportError:
             from src.models.wan_video_dit import WanModel
-            from src.models.quantization.fakequant import convert_model_to_fakequant
+            from src.models.quantization.fakequant import convert_model_to_fakequant, convert_ops_to_fakequant
 
         # FlashVSR-v1.1 config
         dit = WanModel(
@@ -951,6 +951,36 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
             fq_pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
         fq_pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu", weights_only=False), strict=True)
         fq_pipe.denoising_model().LQ_proj_in.to(device)
+
+        # Optional component-level FakeQuant for sensitivity analysis. The DiT Linear
+        # layers are already fake-quantized by the checkpoint path above; these
+        # scopes let us isolate extra quality impact from VAE/decoder/LQ/Conv3d ops.
+        scopes = {x.strip().lower() for x in (fakequant_extra_scopes or "").split(",") if x.strip()}
+        if "all" in scopes:
+            scopes.update({"wan_vae", "tcdecoder", "lq_proj_in", "dit_conv3d"})
+        if scopes:
+            if fq_mode not in ("a8w8", "a16w8"):
+                raise ValueError("fakequant_extra_scopes currently supports only FakeQuant_A8W8 or FakeQuant_A16W8")
+            log(f"Applying extra FakeQuant scopes: {sorted(scopes)}", message_type='info', icon="🧪")
+            if "wan_vae" in scopes and fq_pipe.vae is not None:
+                convert_ops_to_fakequant(fq_pipe.vae, mode=fq_mode, op_types=("linear", "conv2d", "conv3d"), prefix="wan_vae")
+            if "tcdecoder" in scopes and fq_pipe.TCDecoder is not None:
+                convert_ops_to_fakequant(fq_pipe.TCDecoder, mode=fq_mode, op_types=("linear", "conv2d", "conv3d"), prefix="tcdecoder")
+            if "lq_proj_in" in scopes and hasattr(fq_pipe.denoising_model(), "LQ_proj_in"):
+                convert_ops_to_fakequant(fq_pipe.denoising_model().LQ_proj_in, mode=fq_mode, op_types=("linear", "conv2d", "conv3d"), prefix="lq_proj_in")
+            if "dit_conv3d" in scopes:
+                # Isolate DiT-native Conv3d (patch embedding) from LQ_proj_in, which
+                # is attached under the DiT object but has its own scope above.
+                dit_model = fq_pipe.denoising_model()
+                saved_lq = getattr(dit_model, "LQ_proj_in", None)
+                if saved_lq is not None:
+                    dit_model.LQ_proj_in = None
+                try:
+                    convert_ops_to_fakequant(dit_model, mode=fq_mode, op_types=("conv3d",), prefix="dit_conv3d")
+                finally:
+                    if saved_lq is not None:
+                        dit_model.LQ_proj_in = saved_lq
+
         fq_pipe.to(device, dtype=dtype)
         fq_pipe.enable_vram_management(num_persistent_param_in_dit=None)
         fq_pipe.init_cross_kv(prompt_path=prompt_path)

@@ -794,6 +794,8 @@ class WanVideoVAE(nn.Module):
             if tiled:
                 tile_size = (tile_size[0] * 8, tile_size[1] * 8)
                 tile_stride = (tile_stride[0] * 8, tile_stride[1] * 8)
+                # tiled_encode expects (B, C, T, H, W); single-frame video has no T axis
+                video = video.unsqueeze(2)  # (1, 3, H, W) -> (1, 3, 1, H, W)
                 hidden_state = self.tiled_encode(video, device, tile_size, tile_stride)
             else:
                 hidden_state = self.single_encode(video, device)

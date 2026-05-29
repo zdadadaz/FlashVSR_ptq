@@ -216,12 +216,13 @@ def run_calibration(
 
     model.eval()
     device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
     with torch.no_grad():
         for batch in tqdm(loader, desc="Calibration"):
             # Dataset returns (B, T, C, H, W) where T=num_frames
-            latents = batch["latents"].to(device).float()  # (B, T, C, H, W)
+            latents = batch["latents"].to(device=device, dtype=dtype)  # (B, T, C, H, W)
             timesteps = batch["timesteps"].to(device).float().squeeze(-1)  # (B,)
-            contexts = batch["contexts"].to(device)  # (B, 10, 4096)
+            contexts = batch["contexts"].to(device=device, dtype=dtype)  # (B, 10, 4096)
 
             try:
                 for i in range(latents.shape[0]):

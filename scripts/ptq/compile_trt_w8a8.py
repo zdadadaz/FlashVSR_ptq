@@ -129,7 +129,6 @@ def compile_trt_engine(model, output_engine, input_spec):
     trt_model = dynamo.compile(
         model,
         inputs=[input_spec],
-        enabled_precisions={torch.float16},  # Model weights are int8; TRT uses torch_executed for int8 ops
         require_full_compilation=True,
     )
 
@@ -204,7 +203,16 @@ def main():
         # Step 2: Convert model to W8A8 (weight-only int8 + int8 activations)
         print("Applying W8A8 quantization to model...")
         from src.models.quantization.quant import convert_model_to_w8a8
-        convert_model_to_w8a8(model, act_stats, method='percentile99', engine='bf16')
+
+        # Transform act_stats from {name: {'act_min', 'act_max', ...}} to {name: amax_tensor}
+        # convert_model_to_w8a8 expects act_amax as tensor with shape matching in_features
+        act_stats_transformed = {}
+        for name, stats in act_stats.items():
+            # act_max is a scalar, convert to tensor with shape (in_features,)
+            act_max = stats['act_max']  # scalar value
+            act_stats_transformed[name] = torch.tensor(act_max, dtype=torch.float32) if isinstance(act_max, float) else act_max
+
+        convert_model_to_w8a8(model, act_stats_transformed, method='percentile99', engine='bf16')
 
         # Create input spec
         input_spec = make_trt_input_spec()

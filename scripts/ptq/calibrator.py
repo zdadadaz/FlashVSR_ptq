@@ -164,7 +164,6 @@ def load_model(checkpoint_path):
     print(f"Loading checkpoint from {checkpoint_path}...")
     if checkpoint_path.endswith('.safetensors'):
         from safetensors.torch import load_file
-
         state_dict = load_file(checkpoint_path)
     else:
         state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -172,7 +171,7 @@ def load_model(checkpoint_path):
     model = WanModel(
         dim=1536,
         eps=1e-5,
-        ffn_dim=6144,
+        ffn_dim=8960,       # FlashVSR-v1.1 specific (DO NOT use ffn_dim=6144)
         freq_dim=256,
         in_dim=16,
         num_heads=12,

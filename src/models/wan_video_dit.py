@@ -447,7 +447,7 @@ class SelfAttention(nn.Module):
 
         if is_stream:
             return self.o(x), cache_k, cache_v
-        return self.o(x)
+        return self.o(x), None, None
 
 
 class CrossAttention(nn.Module):
@@ -489,9 +489,19 @@ class CrossAttention(nn.Module):
         y 即文本上下文（未做其他分支）。
         """
         q = self.norm_q(self.q(x))
-        assert self.cache_k is not None and self.cache_v is not None
-        k = self.cache_k
-        v = self.cache_v
+        if self.cache_k is not None and self.cache_v is not None:
+            # Streaming mode: use cached KV from text embedding
+            k = self.cache_k
+            v = self.cache_v
+        else:
+            # Calibration / offline mode: compute K,V from provided context y directly.
+            # Cast y to float to avoid bf16/float matmul mismatch in linear layers.
+            y_float = y.to(torch.float32)
+            k = self.norm_k(self.k(y_float))
+            v = self.v(y_float)
+            # Return in same dtype as q for attention computation
+            k = k.to(dtype=q.dtype)
+            v = v.to(dtype=q.dtype)
 
         x = self.attn(q, k, v)
         return self.o(x)
@@ -529,17 +539,18 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        self_attn_output, self_attn_cache_k, self_attn_cache_v = self.self_attn(
+        self_attn_output, _, _ = self.self_attn(
             input_x, freqs, f, h, w, local_num, topk, train_img, block_id,
             kv_len=kv_len, is_full_block=is_full_block, is_stream=is_stream,
             pre_cache_k=pre_cache_k, pre_cache_v=pre_cache_v, local_range = local_range)
-
         x = self.gate(x, gate_msa, self_attn_output)
+        # Cross attention: in streaming mode uses cached KV; in calibration/offline
+        # mode (no cache) compute K,V directly from provided context y.
         x = x + self.cross_attn(self.norm3(x), context, is_stream=is_stream)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         if is_stream:
-            return x, self_attn_cache_k, self_attn_cache_v
+            return x, None, None
         return x
 
 

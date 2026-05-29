@@ -130,9 +130,10 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
     parser.add_argument(
         '--quantize_mode',
         type=str,
-        choices=['None', 'W8A16', 'W8A8_SmoothQuant', 'W8A8', 'W8A8_PTQ'],
+        choices=['None', 'W8A16', 'W8A8_SmoothQuant', 'W8A8', 'W8A8_PTQ',
+                 'FakeQuant_A8W8', 'FakeQuant_A8W4', 'FakeQuant_A16W8', 'FakeQuant_A16W4'],
         default='None',
-        help='Quantization mode for the DiT model. "None": standard precision. "W8A16": 8-bit weights, 16-bit activations. "W8A8_SmoothQuant": 8-bit weights and activations with SmoothQuant migration. "W8A8": 8-bit weights and activations without migration (requires calibration). "W8A8_PTQ": uses pre-compiled TensorRT engine for W8A8 inference. (default: None)'
+        help='Quantization mode for the DiT model. "None": standard precision. "W8A16": 8-bit weights, 16-bit activations. "W8A8_SmoothQuant": 8-bit weights+activations with SmoothQuant migration. "W8A8": 8-bit w+a without migration (requires calibration). "W8A8_PTQ": pre-compiled TensorRT engine. "FakeQuant_*": pre-converted checkpoint via fakequant_calibrate.py + fakequant_convert.py. (default: None)'
     )
     parser.add_argument(
         '--w8a8_engine',

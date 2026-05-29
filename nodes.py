@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from huggingface_hub import snapshot_download, hf_hub_download
 try:
-    from .src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
+    from .src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline, FlashVSRFakeQuantPipeline
     from .src.models.TCDecoder import build_tcdecoder
     from .src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
     from .src.models import wan_video_dit
@@ -42,7 +42,7 @@ try:
         VAE_FULL_DIM, VAE_LIGHT_DIM, VAE_Z_DIM
     )
 except ImportError:
-    from src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
+    from src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline, FlashVSRFakeQuantPipeline
     from src.models.TCDecoder import build_tcdecoder
     from src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
     from src.models import wan_video_dit
@@ -840,8 +840,127 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
 
     # Handle pre-quantized DiT model loading manually if needed
     # Check for both W8A16 and W8A8 quantized checkpoints
-    is_quantized_ckpt = "w8a16" in ckpt_path.lower() or "w8a8" in ckpt_path.lower()
-    if is_quantized_ckpt:
+    is_quantized_ckpt = (
+        ("w8a16" in ckpt_path.lower() or "w8a8" in ckpt_path.lower())
+        and "fakequant" not in ckpt_path.lower()
+    )
+    is_fakequant_ckpt = "fakequant" in ckpt_path.lower()
+
+    # FIX: quantize_mode parameter should drive FakeQuant pipeline selection
+    # not just be informational. Map quantize_mode → fq_mode for FakeQuant paths.
+    fq_mode = None
+    if quantize_mode in ("FakeQuant_A8W8", "FakeQuant_A8W4", "FakeQuant_A16W8", "FakeQuant_A16W4"):
+        mode_map = {
+            "FakeQuant_A8W8": "a8w8",
+            "FakeQuant_A8W4": "a8w4",
+            "FakeQuant_A16W8": "a16w8",
+            "FakeQuant_A16W4": "a16w4",
+        }
+        fq_mode = mode_map[quantize_mode]
+        is_fakequant_ckpt = True
+        log(f"quantize_mode={quantize_mode} → FakeQuant mode={fq_mode}", message_type='info', icon="🔧")
+
+    if is_fakequant_ckpt:
+        log(f"FakeQuant checkpoint detected: {ckpt_path}", message_type='info', icon="🔍")
+        try:
+            from .src.models.wan_video_dit import WanModel
+            from .src.models.quantization.fakequant import convert_model_to_fakequant
+        except ImportError:
+            from src.models.wan_video_dit import WanModel
+            from src.models.quantization.fakequant import convert_model_to_fakequant
+
+        # FlashVSR-v1.1 config
+        dit = WanModel(
+            dim=1536, eps=1e-5, ffn_dim=8960, freq_dim=256, in_dim=16,
+            num_heads=12, num_layers=30, out_dim=16, patch_size=(1, 2, 2), text_dim=4096
+        )
+        # Detect correct FakeQuant mode from ckpt path
+        # Priority: fq_mode from quantize_mode > path inference > default
+        detected_fq_mode = fq_mode
+        if detected_fq_mode is None:
+            detected_fq_mode = "a8w8"
+            if "a16w8" in ckpt_path.lower():
+                detected_fq_mode = "a16w8"
+            elif "a8w4" in ckpt_path.lower():
+                detected_fq_mode = "a8w4"
+            elif "a16w4" in ckpt_path.lower():
+                detected_fq_mode = "a16w4"
+        fq_mode = detected_fq_mode
+        log(f"FakeQuant mode: {fq_mode}", message_type='info', icon="🔍")
+        convert_model_to_fakequant(dit, mode=fq_mode, act_stats=None)
+
+        # Load state dict
+        if ckpt_path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            sd_dit = load_file(ckpt_path)
+        else:
+            sd_dit = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+        new_sd = {}
+        for k, v in sd_dit.items():
+            if k.startswith("model."):
+                new_sd[k[6:]] = v
+            else:
+                new_sd[k] = v
+        dit.load_state_dict(new_sd, strict=False)
+        dit.eval()
+
+        # Register in ModelManager (standard path) so from_model_manager can fetch it
+        mm.model.append(dit)
+        mm.model_path.append(ckpt_path)
+        mm.model_name.append("wan_video_dit")
+
+        # Load VAE normally
+        mm.load_models([vae_path])
+
+        # Create FakeQuant pipeline via from_model_manager (proper pipeline init)
+        fq_pipe = FlashVSRFakeQuantPipeline.from_model_manager(
+            mm, torch_dtype=dtype, device=device, quant_mode=fq_mode
+        )
+
+        # Build TCDecoder and VAE explicitly (same as full/tiny pipelines)
+        multi_scale_channels = [512, 256, 128, 128]
+        fq_pipe.TCDecoder = build_tcdecoder(
+            new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16 + 768
+        )
+        fq_pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device, weights_only=False), strict=False)
+        fq_pipe.TCDecoder.clean_mem()
+
+        # Explicit VAE instantiation
+        if vae_class == LightX2VVAE:
+            fq_pipe.vae = LightX2VVAE(z_dim=vae_z_dim, dim=vae_dim, use_full_arch=use_full_arch)
+        elif vae_class == Wan22VideoVAE:
+            fq_pipe.vae = Wan22VideoVAE(z_dim=vae_z_dim, dim=vae_dim)
+        else:
+            fq_pipe.vae = WanVideoVAE(z_dim=vae_z_dim, dim=vae_dim)
+
+        if vae_path.endswith(".safetensors"):
+            import safetensors.torch
+            vae_sd = safetensors.torch.load_file(vae_path)
+        else:
+            vae_sd = torch.load(vae_path, map_location="cpu", weights_only=False)
+        fq_pipe.vae.load_state_dict(vae_sd, strict=False)
+        fq_pipe.vae = fq_pipe.vae.to(device=device, dtype=dtype)
+        fq_pipe.vae.model.encoder = None
+        fq_pipe.vae.model.conv1 = None
+
+        # Load LQ_proj_in
+        if model == "FlashVSR":
+            fq_pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
+        else:
+            fq_pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
+        fq_pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu", weights_only=False), strict=True)
+        fq_pipe.denoising_model().LQ_proj_in.to(device)
+        fq_pipe.to(device, dtype=dtype)
+        fq_pipe.enable_vram_management(num_persistent_param_in_dit=None)
+        fq_pipe.init_cross_kv(prompt_path=prompt_path)
+        fq_pipe.load_models_to_device(["dit", "vae"])
+        fq_pipe.offload_model()
+
+        log(f"FakeQuant pipeline initialized: mode={fq_mode}", message_type='info', icon="✅")
+        return fq_pipe
+
+    elif is_quantized_ckpt:
         log(f"Manual loading detected for quantized DiT: {ckpt_path}", message_type='info', icon="🔍")
         # Instantiate model structure
         try:
@@ -941,7 +1060,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
         log(f"Loaded TCDecoder for Full Mode (official FlashVSR approach)", message_type='info', icon="✅")
     else:
         # For non-full modes, we still need to load VAE to the model manager if not manually handled
-        if not is_quantized_ckpt:
+        if not is_quantized_ckpt and not is_fakequant_ckpt:
             mm.load_models([ckpt_path, vae_path])
             
         if mode == "tiny":
@@ -1026,6 +1145,20 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
             pipe.trt_engine_ = load_trt_engine(trt_engine_path)
         else:
             log("Warning: W8A8_PTQ mode without trt_engine_path - DiT not loaded!", message_type='warning', icon='⚠️')
+
+    elif quantize_mode in ("FakeQuant_A8W8", "FakeQuant_A8W4", "FakeQuant_A16W8", "FakeQuant_A16W4"):
+        # quantize_mode already drove pipeline creation in the is_fakequant_ckpt branch above.
+        # If we reach here with this quantize_mode, it means the checkpoint path
+        # didn't contain "fakequant" — we still want to create FakeQuant pipeline
+        # if quantize_mode was explicitly set. The above branch handles that via
+        # setting is_fakequant_ckpt=True. So this branch is a no-op for the path-based
+        # flow, but guard against calling code that incorrectly passes this mode
+        # when no FakeQuant checkpoint exists.
+        if not is_fakequant_ckpt:
+            log(f"Warning: quantize_mode={quantize_mode} but no FakeQuant checkpoint found. "
+                "Provide a checkpoint path containing 'fakequant' or a converted checkpoint.",
+                message_type='warning', icon='⚠️')
+        pass
 
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv(prompt_path=prompt_path)

@@ -129,6 +129,11 @@ def main():
     if args.calibration_cache:
         act_stats = load_calibration_cache(args.calibration_cache)
         print(f"[Convert] Loaded calibration for {len(act_stats)} layers")
+    if args.mode.startswith("a8") and not act_stats:
+        raise RuntimeError(
+            f"Mode {args.mode} requires a non-empty --calibration_cache with "
+            "calibrated act_scale and zero_point entries."
+        )
 
     # ------------------------------------------------------------------
     # 3. Convert nn.Linear → FakeQuantLinear

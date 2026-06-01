@@ -101,13 +101,19 @@ class FakeQuantLinear(nn.Module):
 
         # ---- (1) Activation quantization → int8 → float32 ----
         if self.activation_mode == "a8":
-            # Dynamic per-token symmetric int8 activation QDQ is much more stable for
-            # DiT activations than stale/global min-max caches. Reduce over the
-            # feature dimension only, preserving token/batch/time variation.
+            # Static calibrated signed-int8 activation QDQ.
+            # act_scale / act_zero_point are collected by fakequant_calibrate.py
+            # and loaded by fakequant_convert.py.  Reshape dynamically so both
+            # 2D inputs [B,C] and sequence inputs [B,L,C] broadcast correctly.
             x_float = x.detach().to(torch.float32)
-            x_scale = torch.amax(torch.abs(x_float), dim=-1, keepdim=True).clamp(min=1e-6) / 127.0
-            x_q = torch.clamp(torch.round(x_float / x_scale), -127, 127).to(torch.int8)
-            x_fp = x_q.to(torch.float32) * x_scale
+            x_scale = self.act_scale.to(device=x.device, dtype=torch.float32).reshape(
+                *([1] * (x.dim() - 1)), self.in_features
+            ).clamp(min=1e-6)
+            x_zero_point = self.act_zero_point.to(device=x.device, dtype=torch.float32).reshape(
+                *([1] * (x.dim() - 1)), self.in_features
+            )
+            x_q = torch.clamp(torch.round(x_float / x_scale + x_zero_point), -128, 127).to(torch.int8)
+            x_fp = (x_q.to(torch.float32) - x_zero_point) * x_scale
         else:
             # a16: no-op, just promote to float for matmul
             x_fp = x.float()

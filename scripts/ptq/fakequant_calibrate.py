@@ -12,9 +12,11 @@ Supports modes: a16w8, a8w8, a16w4, a8w4
 """
 
 import argparse
+import glob
 import json
 import math
 import os
+import random
 import sys
 
 import cv2
@@ -27,6 +29,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.models.wan_video_dit import WanModel
 from src.models.quantization.fakequant import collect_activation_stats_fakequant
+
+
+VIDEO_EXTENSIONS = ("*.mp4", "*.mov", "*.mkv", "*.avi", "*.webm")
+
+
+def discover_calibration_videos(dataset_train: str, num_videos: int, seed: int) -> list[str]:
+    """Recursively sample calibration videos from datasets/train."""
+    candidates = []
+    for ext in VIDEO_EXTENSIONS:
+        candidates.extend(glob.glob(os.path.join(dataset_train, "**", ext), recursive=True))
+    candidates = sorted(set(candidates))
+    if not candidates:
+        raise RuntimeError(f"No calibration videos found under: {dataset_train}")
+    rng = random.Random(seed)
+    if len(candidates) <= num_videos:
+        return candidates
+    return sorted(rng.sample(candidates, num_videos))
 
 
 # =============================================================================
@@ -246,8 +265,14 @@ def load_checkpoint(path: str, model: WanModel):
 
 def main():
     parser = argparse.ArgumentParser(description="PTQ Calibration for FakeQuant FlashVSR")
-    parser.add_argument("--video",          type=str, required=True,
-                       help="Video file for calibration (e.g. data/lowres/carphone_qcif.mp4)")
+    parser.add_argument("--video",          type=str, default=None,
+                       help="Single video file for calibration (legacy path)")
+    parser.add_argument("--dataset_train",  type=str, default="datasets/train",
+                       help="Training video root used for calibration when --video is not set")
+    parser.add_argument("--num_videos",     type=int, default=10,
+                       help="Number of random videos to sample from --dataset_train")
+    parser.add_argument("--seed",           type=int, default=42,
+                       help="Random seed for selecting calibration videos")
     parser.add_argument("--checkpoint",    type=str, required=True,
                        help="Path to DiT .safetensors checkpoint")
     parser.add_argument("--output_cache",  type=str, required=True,
@@ -288,17 +313,37 @@ def main():
     model.cuda().eval()
 
     # ------------------------------------------------------------------
-    # 2. Collect latent samples from video
+    # 2. Collect latent samples from one video or random datasets/train videos
     # ------------------------------------------------------------------
-    print(f"\n[Calibrate] Sampling latents from video: {args.video}")
-    latents, fps = sample_latents_from_video(
-        video_path=args.video,
-        num_frames=args.calib_frames,
-        latent_channels=16,
-        frame_size=frame_size,
-        vae_path=args.vae_path,
-        vae_model=args.vae_model,
-    )
+    if args.video:
+        selected_videos = [args.video]
+    else:
+        selected_videos = discover_calibration_videos(args.dataset_train, args.num_videos, args.seed)
+
+    print(f"\n[Calibrate] Selected {len(selected_videos)} calibration video(s):")
+    for idx, video_path in enumerate(selected_videos, 1):
+        print(f"  {idx:02d}. {video_path}")
+
+    latent_chunks = []
+    fps_values = []
+    for video_path in selected_videos:
+        print(f"\n[Calibrate] Sampling latents from video: {video_path}")
+        latents_i, fps = sample_latents_from_video(
+            video_path=video_path,
+            num_frames=args.calib_frames,
+            latent_channels=16,
+            frame_size=frame_size,
+            vae_path=args.vae_path,
+            vae_model=args.vae_model,
+        )
+        latent_chunks.append(latents_i)
+        fps_values.append(fps)
+
+    latents = torch.cat(latent_chunks, dim=0)
+    # Shuffle frame-level calibration samples so --num_samples covers all videos
+    # instead of only the first selected video when num_samples is small.
+    generator = torch.Generator().manual_seed(args.seed)
+    latents = latents[torch.randperm(latents.shape[0], generator=generator)]
     latents = latents.cuda().to(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
 
     # ------------------------------------------------------------------
@@ -336,6 +381,11 @@ def main():
         "mode": args.mode,
         "num_samples": args.num_samples,
         "video": args.video,
+        "dataset_train": args.dataset_train if not args.video else None,
+        "num_videos": len(selected_videos),
+        "seed": args.seed,
+        "selected_videos": selected_videos,
+        "fps_values": fps_values,
         "latent_size": args.latent_size,
         "checkpoint": args.checkpoint,
         "vae_path": args.vae_path,

@@ -33,7 +33,8 @@ class FakeQuantLinear(nn.Module):
     Activation modes:
       a16: no activation quantization — pass through in original dtype.
            x_fp = x.float()  # no int conversion
-      a8:  activation quantized to int8 via per-channel scale (ch_axis=-1).
+      a8:  activation quantized to signed int8 with calibrated asymmetric
+           per-channel scale and zero-point (ch_axis=-1).
 
     Weight modes:
       w8:  symmetric int8, one scale per output channel.
@@ -426,6 +427,7 @@ def convert_model_to_fakequant(
 
     converted = 0
     fallback = 0
+    missing_act_stats = []
 
     def get_parent_and_name(mod, full_name):
         parts = full_name.rsplit(".", 1)
@@ -452,8 +454,13 @@ def convert_model_to_fakequant(
                 if leaf in act_stats:
                     s = act_stats[leaf]
             if s is not None:
-                act_scale = s.get("scale") or s.get("act_scale")
-                act_zp    = s.get("zero_point")
+                act_scale = s.get("scale", None)
+                if act_scale is None:
+                    act_scale = s.get("act_scale", None)
+                act_zp = s.get("zero_point", None)
+        if activation_mode == "a8" and act_stats is not None and act_scale is None:
+            missing_act_stats.append(full_name)
+            continue
 
         try:
             new_mod = FakeQuantLinear.from_float(
@@ -470,6 +477,14 @@ def convert_model_to_fakequant(
         except Exception as e:
             print(f"  [FakeQuant] Failed to convert {full_name}: {e}")
             fallback += 1
+
+    if missing_act_stats:
+        preview = ", ".join(missing_act_stats[:8])
+        suffix = "..." if len(missing_act_stats) > 8 else ""
+        raise RuntimeError(
+            f"A8 FakeQuant requires calibrated asymmetric activation stats for every "
+            f"Linear layer; missing {len(missing_act_stats)} layer(s): {preview}{suffix}"
+        )
 
     print(f"[FakeQuant] {mode}: {converted} converted, {fallback} fallback (unchanged)")
     return model
@@ -504,6 +519,9 @@ def collect_activation_stats_fakequant(
 
     Returns:
         dict: {layer_name: {'act_scale': tensor [Cin], 'zero_point': tensor [Cin]}}
+        Activation scales use signed-int8 asymmetric quantization:
+            q = clamp(round(x / scale + zero_point), -128, 127)
+            x_fp = (q - zero_point) * scale
 
     Uses register_forward_hook on every nn.Linear — avoids time_embedding
     dtype issues by bypassing it entirely (hooks fire on sub-module forwards).
@@ -512,21 +530,6 @@ def collect_activation_stats_fakequant(
 
     act_stats = {}
     hooks = []
-
-    # ---- Pre-compute t_mod once to satisfy model internals ----
-    model.cuda()
-    t_big = torch.randint(0, 1000, (1,), device="cuda")
-    t_emb = model.time_embedding(sinusoidal_embedding_1d(model.freq_dim, t_big.float()))  # float!
-    t_mod_for_fwd = model.time_projection(t_emb).unflatten(1, (6, model.dim))  # (B, 6, dim)
-    t_cpu = t_big.cpu()  # keep on CPU for reuse
-
-    # Fixed freqs tensor
-    f, h, w = 4, 15, 20
-    freqs = torch.cat([
-        model.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-        model.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        model.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-    ], dim=-1).reshape(f * h * w, 1, -1).cuda().float()
 
     # ---- Hook factory ----
     def make_hook(name):
@@ -548,6 +551,14 @@ def collect_activation_stats_fakequant(
         if isinstance(module, nn.Linear):
             h = module.register_forward_hook(make_hook(name))
             hooks.append(h)
+
+    # ---- Pre-compute t_mod once to satisfy model internals ----
+    # Hooks must already be registered here so time_embedding/time_projection
+    # receive calibrated asymmetric A8 stats too.
+    model.cuda()
+    t_big = torch.randint(0, 1000, (1,), device="cuda")
+    t_emb = model.time_embedding(sinusoidal_embedding_1d(model.freq_dim, t_big.float()))  # float!
+    t_mod_for_fwd = model.time_projection(t_emb).unflatten(1, (6, model.dim))  # (B, 6, dim)
 
     # ---- Run block-level forward (no time_embedding call per iteration) ----
     # WanModel expects input in (B, H, W, C) format — latents are (B, C, H, W)
@@ -596,6 +607,10 @@ def collect_activation_stats_fakequant(
                 x = block(x, ctx, t_mod_for_fwd, freqs_i,
                           f_, h_, w_, f_ * h_ * w_, f_ * h_ * w_,
                           False, i, 1, False, False, None, None)
+            # Run the output projection as well so head.head receives calibrated
+            # asymmetric A8 activation stats instead of falling back to default
+            # scale=1 / zero_point=0 during conversion.
+            _ = model.head(x, t_emb)
     for h in hooks:
         h.remove()
 

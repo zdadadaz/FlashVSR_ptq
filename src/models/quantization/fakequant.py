@@ -267,14 +267,21 @@ class FakeQuantLinear(nn.Module):
 
         # ---- Activation calibration ----
         if activation_mode == "a8" and act_scale is not None:
-            # Broadcast into [1, 1, Cin] shape expected by forward
-            if act_scale.dim() == 1:
+            # Broadcast into [1, 1, Cin] shape expected by forward.
+            # Per-tensor static caches store a single scalar/list entry; expand
+            # that scalar to all input channels so the runtime QDQ path remains
+            # unchanged and checkpoint loading stays compatible.
+            if act_scale.numel() == 1:
+                new_module.act_scale.copy_(act_scale.reshape(1, 1, 1).expand_as(new_module.act_scale))
+            elif act_scale.dim() == 1:
                 new_module.act_scale.copy_(act_scale.view(1, 1, -1))
             else:
                 new_module.act_scale.copy_(act_scale)
 
             if act_zero_point is not None:
-                if act_zero_point.dim() == 1:
+                if act_zero_point.numel() == 1:
+                    new_module.act_zero_point.copy_(act_zero_point.reshape(1, 1, 1).expand_as(new_module.act_zero_point))
+                elif act_zero_point.dim() == 1:
                     new_module.act_zero_point.copy_(act_zero_point.view(1, 1, -1))
                 else:
                     new_module.act_zero_point.copy_(act_zero_point)
@@ -295,13 +302,17 @@ class FakeQuantLinear(nn.Module):
             return
         if scale is not None:
             scale = scale.to(device=self.act_scale.device)
-            if scale.dim() == 1:
+            if scale.numel() == 1:
+                self.act_scale.copy_(scale.reshape(1, 1, 1).expand_as(self.act_scale))
+            elif scale.dim() == 1:
                 self.act_scale.copy_(scale.view(1, 1, -1))
             else:
                 self.act_scale.copy_(scale)
         if zero_point is not None:
             zero_point = zero_point.to(device=self.act_zero_point.device)
-            if zero_point.dim() == 1:
+            if zero_point.numel() == 1:
+                self.act_zero_point.copy_(zero_point.reshape(1, 1, 1).expand_as(self.act_zero_point))
+            elif zero_point.dim() == 1:
                 self.act_zero_point.copy_(zero_point.view(1, 1, -1))
             else:
                 self.act_zero_point.copy_(zero_point)
@@ -721,6 +732,8 @@ def collect_activation_stats_fakequant(
         result[name] = {
             "act_scale": act_scale.squeeze().float(),
             "zero_point": zero_pt.squeeze().long(),
+            "act_min": act_min.squeeze().float(),
+            "act_max": act_max.squeeze().float(),
         }
     return result
 

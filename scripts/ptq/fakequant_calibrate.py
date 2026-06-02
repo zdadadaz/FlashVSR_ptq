@@ -395,10 +395,17 @@ def main():
 
     if act_stats:
         for name, s in act_stats.items():
-            cache[name] = {
+            entry = {
                 "act_scale": s["act_scale"].cpu().numpy().tolist(),
                 "zero_point": s["zero_point"].cpu().numpy().tolist(),
             }
+            # Preserve min/max so static per-tensor caches can be derived from
+            # the same calibration run without re-running the DiT forward pass.
+            if "act_min" in s:
+                entry["act_min"] = s["act_min"].cpu().numpy().tolist()
+            if "act_max" in s:
+                entry["act_max"] = s["act_max"].cpu().numpy().tolist()
+            cache[name] = entry
 
     with open(args.output_cache, "w") as f:
         json.dump(cache, f, indent=2)

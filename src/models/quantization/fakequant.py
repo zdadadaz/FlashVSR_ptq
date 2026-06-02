@@ -205,6 +205,7 @@ class FakeQuantLinear(nn.Module):
         weight_mode: str = "w8",
         act_scale: torch.Tensor = None,
         act_zero_point: torch.Tensor = None,
+        act_mean: torch.Tensor = None,
         act_quant_enabled: bool = True,
         activation_qdq_mode: str = "static_asymmetric",
         ch_axis: int = -1,   # kept for API compat, unused
@@ -265,6 +266,17 @@ class FakeQuantLinear(nn.Module):
             new_module.weight_int.copy_(w_int8)
             new_module.weight_scale.copy_(w_scale)
 
+        # ---- Bias correction ----
+        # Lightweight PTQ recovery: if calibration provides per-input-channel
+        # mean activation, compensate expected rounding error in the output bias:
+        # E[x] @ (W_fp - W_qdq)^T. This is deterministic and training-free.
+        bias_correction = None
+        if act_mean is not None:
+            x_mean = act_mean.detach().to(device=device, dtype=torch.float32).reshape(-1)
+            if x_mean.numel() == linear_module.in_features:
+                w_deq = new_module._dequantize_weight(device).to(torch.float32)
+                bias_correction = torch.matmul(x_mean, (w.to(torch.float32) - w_deq).t())
+
         # ---- Activation calibration ----
         if activation_mode == "a8" and act_scale is not None:
             # Broadcast into [1, 1, Cin] shape expected by forward.
@@ -288,6 +300,8 @@ class FakeQuantLinear(nn.Module):
 
         if linear_module.bias is not None:
             new_module.bias.copy_(linear_module.bias.data.float())
+            if bias_correction is not None:
+                new_module.bias.add_(bias_correction)
 
         return new_module
 
@@ -453,43 +467,30 @@ def convert_model_to_fakequant(
     method: str = "max",
     static_quality_policy: str = "none",
     activation_qdq_mode: str = "static_asymmetric",
+    layer_policy: dict | None = None,
+    enable_bias_correction: bool = False,
 ):
-    """
-    Recursively replace nn.Linear → FakeQuantLinear.
+    """Recursively replace nn.Linear → FakeQuantLinear.
 
-    Args:
-        model: nn.Module to convert
-        mode: "a16w8", "a8w8", "a16w4", "a8w4"
-        act_stats: calibration dict {name: {'act_scale': tensor, 'zero_point': tensor}}
-        ch_axis: (unused, kept for API compat)
-        method: weight quantization method (only "max" currently)
-        static_quality_policy: "none", "sensitive_a16", or "self_attn_only_a8".
-            Non-"none" policies keep structurally A8W8 modules but disable
-            activation QDQ for selected sensitive Linear layers, so checkpoints
-            still reload through the normal FakeQuant_A8W8 path while using
-            A16W8 behavior for those activations.
-        activation_qdq_mode: "static_asymmetric", "dynamic_symmetric", or
-            "dynamic_asymmetric" for A8 activation QDQ. Dynamic modes compute
-            activation scale/zero-point at runtime per token and do not require
-            static calibration stats for activation math.
+    `layer_policy` is an optional mapping `{layer_name: {mode, activation_qdq_mode}}`
+    used by Person A's August PTQ recovery flow. It can mix `a8w8`, `a16w8`,
+    and `fp16_skip` at per-Linear granularity while preserving the existing
+    global-mode behavior when omitted.
     """
     if activation_qdq_mode not in ("static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"):
         raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
-    if mode.startswith("a16"):
-        activation_mode = "a16"
-        weight_mode = mode[3:]
-    elif mode.startswith("a8"):
-        activation_mode = "a8"
-        weight_mode = mode[2:]
-    else:
+    if not (mode.startswith("a16") or mode.startswith("a8")):
         raise ValueError(f"Unsupported fakequant mode: {mode}")
-    if weight_mode not in ("w8", "w4"):
-        raise ValueError(f"Unsupported fakequant weight mode from {mode}: {weight_mode}")
+    default_weight_mode = mode[3:] if mode.startswith("a16") else mode[2:]
+    if default_weight_mode not in ("w8", "w4"):
+        raise ValueError(f"Unsupported fakequant weight mode from {mode}: {default_weight_mode}")
 
     converted = 0
     fallback = 0
     missing_act_stats = []
     act_disabled = 0
+    skipped_fp16 = 0
+    mode_counts = {}
 
     def should_disable_activation_quant(full_name: str) -> bool:
         if static_quality_policy in (None, "", "none"):
@@ -506,8 +507,6 @@ def convert_model_to_fakequant(
         )
         if full_name.startswith(sensitive_prefixes):
             return True
-        # Static activation min/max is especially brittle around DiT FFN GELU
-        # tails; keep FFN activations in fp16 while retaining int8 weights.
         if ".ffn." in full_name:
             return True
         return False
@@ -522,12 +521,35 @@ def convert_model_to_fakequant(
             parent = getattr(parent, p)
         return parent, leaf_name
 
+    policy = layer_policy or {}
     for full_name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
 
-        # Retrieve activation calibration if available
-        act_scale, act_zp = None, None
+        entry = policy.get(full_name, {})
+        layer_mode = entry.get("mode", mode) if isinstance(entry, dict) else (entry or mode)
+        layer_qdq_mode = (
+            entry.get("activation_qdq_mode", activation_qdq_mode)
+            if isinstance(entry, dict) else activation_qdq_mode
+        )
+        if layer_qdq_mode not in ("static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"):
+            raise ValueError(f"Unsupported activation_qdq_mode for {full_name}: {layer_qdq_mode}")
+        if layer_mode == "fp16_skip":
+            skipped_fp16 += 1
+            mode_counts[layer_mode] = mode_counts.get(layer_mode, 0) + 1
+            continue
+        if layer_mode.startswith("a16"):
+            layer_activation_mode = "a16"
+            layer_weight_mode = layer_mode[3:]
+        elif layer_mode.startswith("a8"):
+            layer_activation_mode = "a8"
+            layer_weight_mode = layer_mode[2:]
+        else:
+            raise ValueError(f"Unsupported layer mode for {full_name}: {layer_mode}")
+        if layer_weight_mode not in ("w8", "w4"):
+            raise ValueError(f"Unsupported layer weight mode for {full_name}: {layer_weight_mode}")
+
+        act_scale, act_zp, act_mean = None, None, None
         if act_stats:
             s = None
             if full_name in act_stats:
@@ -541,9 +563,10 @@ def convert_model_to_fakequant(
                 if act_scale is None:
                     act_scale = s.get("act_scale", None)
                 act_zp = s.get("zero_point", None)
+                act_mean = s.get("act_mean", None)
         if (
-            activation_mode == "a8"
-            and activation_qdq_mode == "static_asymmetric"
+            layer_activation_mode == "a8"
+            and layer_qdq_mode == "static_asymmetric"
             and act_stats is not None
             and act_scale is None
         ):
@@ -551,20 +574,22 @@ def convert_model_to_fakequant(
             continue
 
         try:
-            disable_act_q = activation_mode == "a8" and should_disable_activation_quant(full_name)
+            disable_act_q = layer_activation_mode == "a8" and should_disable_activation_quant(full_name)
             new_mod = FakeQuantLinear.from_float(
                 module,
-                activation_mode=activation_mode,
-                weight_mode=weight_mode,
+                activation_mode=layer_activation_mode,
+                weight_mode=layer_weight_mode,
                 act_scale=act_scale,
                 act_zero_point=act_zp,
+                act_mean=act_mean if enable_bias_correction else None,
                 act_quant_enabled=not disable_act_q,
-                activation_qdq_mode=activation_qdq_mode,
+                activation_qdq_mode=layer_qdq_mode,
                 ch_axis=ch_axis,
             )
             parent, leaf_name = get_parent_and_name(model, full_name)
             setattr(parent, leaf_name, new_mod)
             converted += 1
+            mode_counts[layer_mode] = mode_counts.get(layer_mode, 0) + 1
             if disable_act_q:
                 act_disabled += 1
         except Exception as e:
@@ -579,11 +604,23 @@ def convert_model_to_fakequant(
             f"Linear layer; missing {len(missing_act_stats)} layer(s): {preview}{suffix}"
         )
 
+    summary = {
+        "converted": converted,
+        "fallback": fallback,
+        "fp16_skip": skipped_fp16,
+        "act_q_disabled": act_disabled,
+        "mode_counts": mode_counts,
+        "static_quality_policy": static_quality_policy,
+        "activation_qdq_mode": activation_qdq_mode,
+        "enable_bias_correction": enable_bias_correction,
+    }
     print(
         f"[FakeQuant] {mode}: {converted} converted, {fallback} fallback (unchanged), "
-        f"act_q_disabled={act_disabled}, static_quality_policy={static_quality_policy}, "
-        f"activation_qdq_mode={activation_qdq_mode}"
+        f"fp16_skip={skipped_fp16}, act_q_disabled={act_disabled}, "
+        f"static_quality_policy={static_quality_policy}, activation_qdq_mode={activation_qdq_mode}, "
+        f"mode_counts={mode_counts}"
     )
+    model._fakequant_conversion_summary = summary
     return model
 
 
@@ -634,13 +671,19 @@ def collect_activation_stats_fakequant(
             act = input[0] if isinstance(input, tuple) else input
             act = act.detach().float()
             if name not in act_stats:
-                act_stats[name] = {"min": [], "max": []}
+                act_stats[name] = {"min": [], "max": [], "sum": [], "count": []}
             # Per-channel: amin/amax over all dims except last (feature dim)
             dims_to_reduce = list(range(act.dim() - 1))
             act_min = act.amin(dim=dims_to_reduce, keepdim=True)
             act_max = act.amax(dim=dims_to_reduce, keepdim=True)
             act_stats[name]["min"].append(act_min.cpu())
             act_stats[name]["max"].append(act_max.cpu())
+            act_sum = act.sum(dim=dims_to_reduce, keepdim=True)
+            reduce_count = 1
+            for dim in dims_to_reduce:
+                reduce_count *= act.shape[dim]
+            act_stats[name]["sum"].append(act_sum.cpu())
+            act_stats[name]["count"].append(reduce_count)
         return hook_fn
 
     # ---- Register hooks on every Linear ----
@@ -718,8 +761,11 @@ def collect_activation_stats_fakequant(
             continue
         all_min = torch.cat(stats["min"], dim=0)
         all_max = torch.cat(stats["max"], dim=0)
+        all_sum = torch.stack(stats["sum"], dim=0).sum(dim=0)
+        all_count = float(sum(stats["count"]))
         act_min = torch.amin(all_min, dim=0)
         act_max = torch.amax(all_max, dim=0)
+        act_mean = all_sum / max(all_count, 1.0)
         # Signed int8 asymmetric quantization uses qmin=-128, qmax=127.
         # For q = round(x / scale + zero_point), zero_point must include qmin;
         # using uint8-style zero_point = -min/scale with signed int8 shifts/clips
@@ -734,6 +780,7 @@ def collect_activation_stats_fakequant(
             "zero_point": zero_pt.squeeze().long(),
             "act_min": act_min.squeeze().float(),
             "act_max": act_max.squeeze().float(),
+            "act_mean": act_mean.squeeze().float(),
         }
     return result
 

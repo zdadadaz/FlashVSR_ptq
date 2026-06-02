@@ -144,6 +144,9 @@ def reduce_calibration_cache(
         if act_min is not None and act_max is not None:
             reduced[name]["act_min"] = [float(act_min)]
             reduced[name]["act_max"] = [float(act_max)]
+        if "act_mean" in stats:
+            vals = _as_list(stats["act_mean"])
+            reduced[name]["act_mean"] = [float(sum(vals) / max(len(vals), 1))]
 
     output_cache.parent.mkdir(parents=True, exist_ok=True)
     output_cache.write_text(json.dumps(reduced, indent=2))

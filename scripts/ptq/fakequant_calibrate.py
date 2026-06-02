@@ -405,6 +405,8 @@ def main():
                 entry["act_min"] = s["act_min"].cpu().numpy().tolist()
             if "act_max" in s:
                 entry["act_max"] = s["act_max"].cpu().numpy().tolist()
+            if "act_mean" in s:
+                entry["act_mean"] = s["act_mean"].cpu().numpy().tolist()
             cache[name] = entry
 
     with open(args.output_cache, "w") as f:

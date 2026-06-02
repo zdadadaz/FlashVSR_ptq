@@ -25,6 +25,7 @@ from src.models.quantization.fakequant import (
     FakeQuantLinear,
     convert_model_to_fakequant,
 )
+from src.models.quantization.policy import layer_policy_entries, load_layer_policy
 
 
 # =============================================================================
@@ -92,6 +93,8 @@ def load_calibration_cache(cache_path: str, device="cuda"):
             "act_scale": torch.tensor(stats["act_scale"], device=device),
             "zero_point": torch.tensor(stats["zero_point"], device=device),
         }
+        if "act_mean" in stats:
+            result[name]["act_mean"] = torch.tensor(stats["act_mean"], device=device)
     return result
 
 
@@ -131,6 +134,14 @@ def main():
             "dynamic_asymmetric compute per-token activation scales at runtime."
         ),
     )
+    parser.add_argument(
+        "--policy_json", type=str, default="",
+        help="Optional per-layer policy JSON for mixed precision recovery."
+    )
+    parser.add_argument(
+        "--enable_bias_correction", action="store_true",
+        help="Apply activation-mean-based deterministic bias correction when act_mean exists in calibration cache."
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -154,6 +165,11 @@ def main():
             "--calibration_cache with calibrated act_scale and zero_point entries."
         )
 
+    layer_policy = None
+    if args.policy_json:
+        layer_policy = layer_policy_entries(load_layer_policy(args.policy_json))
+        print(f"[Convert] Loaded layer policy for {len(layer_policy)} layers: {args.policy_json}")
+
     # ------------------------------------------------------------------
     # 3. Convert nn.Linear → FakeQuantLinear
     # ------------------------------------------------------------------
@@ -164,6 +180,8 @@ def main():
         act_stats=act_stats,
         static_quality_policy=args.static_quality_policy,
         activation_qdq_mode=args.activation_qdq_mode,
+        layer_policy=layer_policy,
+        enable_bias_correction=args.enable_bias_correction,
     )
 
     # ------------------------------------------------------------------
@@ -191,6 +209,18 @@ def main():
         if k.endswith("act_quant_enabled") and hasattr(v, "item") and bool(v.item())
     )
     print(f"[Convert] act_quant_enabled: enabled={enabled} disabled={disabled}")
+
+    summary = dict(getattr(model, "_fakequant_conversion_summary", {}))
+    summary.update({
+        "checkpoint": args.checkpoint,
+        "output": args.output,
+        "calibration_cache": args.calibration_cache or None,
+        "policy_json": args.policy_json or None,
+    })
+    summary_path = f"{args.output}.conversion_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[Convert] Summary → {summary_path}")
 
 
 if __name__ == "__main__":

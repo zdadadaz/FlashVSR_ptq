@@ -58,6 +58,13 @@ class FakeQuantLinear(nn.Module):
         self.out_features = out_features
         self.activation_mode = activation_mode   # "a16" or "a8"
         self.weight_mode = weight_mode         # "w8" or "w4"
+        activation_mode_to_id = {"a16": 1, "a8": 2}
+        if activation_mode not in activation_mode_to_id:
+            raise ValueError(f"Unsupported activation_mode: {activation_mode}")
+        self.register_buffer(
+            "activation_mode_code",
+            torch.tensor(activation_mode_to_id[activation_mode], dtype=torch.int32, device=device),
+        )
         self.register_buffer(
             "act_quant_enabled",
             torch.tensor(bool(act_quant_enabled), dtype=torch.bool, device=device),
@@ -118,7 +125,8 @@ class FakeQuantLinear(nn.Module):
         orig_dtype = x.dtype
 
         # ---- (1) Activation quantization → int8 → float32 ----
-        if self.activation_mode == "a8" and bool(self.act_quant_enabled.item()):
+        activation_is_a8 = int(self.activation_mode_code.item()) == 2
+        if activation_is_a8 and bool(self.act_quant_enabled.item()):
             x_float = x.detach().to(torch.float32)
             qdq_mode = int(self.activation_qdq_mode.item())
             if qdq_mode == 1:

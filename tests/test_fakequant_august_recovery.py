@@ -82,6 +82,15 @@ def test_convert_model_to_fakequant_uses_per_layer_policy_modes():
     assert model._fakequant_conversion_summary["mode_counts"] == {"a16w8": 3, "a8w8": 3}
 
 
+def test_activation_mode_code_survives_state_dict_reload_for_mixed_policy():
+    src = FakeQuantLinear(4, 4, activation_mode="a16", weight_mode="w8")
+    dst = FakeQuantLinear(4, 4, activation_mode="a8", weight_mode="w8")
+
+    dst.load_state_dict(src.state_dict(), strict=False)
+
+    assert int(dst.activation_mode_code.item()) == 1
+
+
 def test_bias_correction_changes_bias_when_act_mean_provided():
     layer = nn.Linear(4, 3)
     original_bias = layer.bias.detach().clone()

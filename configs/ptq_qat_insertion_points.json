@@ -1,0 +1,99 @@
+{
+  "schema_version": "flashvsr.ptq_qat_insertion_points.v1",
+  "model": "FlashVSR-v1.1 WanVideoDiT",
+  "scope": {
+    "quantize": ["WanModel / WanVideoDiT DiT path"],
+    "do_not_quantize_initially": [
+      "Wan VAE encode/decode",
+      "TCDecoder",
+      "LQ_proj_in",
+      "scheduler",
+      "video IO",
+      "color correction"
+    ]
+  },
+  "default_teacher": {
+    "precision": "fp16",
+    "quantize_mode": "None",
+    "script": "scripts/teacher/run_fp16_teacher_inference.sh",
+    "artifact_schema": "flashvsr.teacher.v1"
+  },
+  "insertion_points": [
+    {
+      "id": "dit.linear.all",
+      "status": "active_ptq_candidate",
+      "module_match": ["text_embedding.*", "time_embedding.*", "time_projection", "blocks.*.*.*", "head.head"],
+      "op_types": ["torch.nn.Linear"],
+      "coverage_expected": 306,
+      "groups": {
+        "text_embedding": 2,
+        "time_embedding": 2,
+        "time_projection": 1,
+        "self_attn_qkvo": 120,
+        "cross_attn_qkvo": 120,
+        "ffn": 60,
+        "output_head": 1
+      },
+      "ptq": {
+        "weight": "per-output-channel symmetric int8 or int4 QDQ",
+        "activation": [
+          "a16 passthrough for A16W8/A16W4",
+          "dynamic per-token symmetric int8 for best current A8W8 quality",
+          "dynamic per-token asymmetric signed int8 for asymmetric A8W8 experiment",
+          "static calibrated asymmetric signed int8 for sensitivity/mixed-policy experiments"
+        ],
+        "current_best": "a8w8 with dynamic per-token activation QDQ"
+      },
+      "qat": {
+        "initial_policy": "reuse FakeQuantLinear insertion, train only quant params / small adapters first; keep Wan VAE frozen",
+        "learnable_candidates": ["activation scale", "weight scale", "layer-wise activation disable policy"],
+        "teacher_targets": ["final HR output", "selected DiT block outputs", "head input/output"]
+      }
+    },
+    {
+      "id": "dit.patch_embedding.conv3d",
+      "status": "defer_low_priority",
+      "module_match": ["patch_embedding"],
+      "op_types": ["Conv3d"],
+      "reason": "prior extra-scope sensitivity found noise-level impact when isolated from LQ_proj_in"
+    },
+    {
+      "id": "dit.attention.matmul_softmax",
+      "status": "defer_research",
+      "module_match": ["blocks.*.self_attn", "blocks.*.cross_attn"],
+      "op_types": ["attention score/value matmul", "softmax"],
+      "reason": "not covered by FakeQuantLinear; requires attention-kernel aware quantization"
+    },
+    {
+      "id": "tcdecoder.conv2d",
+      "status": "sensitivity_only_not_default",
+      "module_match": ["TCDecoder.*"],
+      "op_types": ["Conv2d", "Linear"],
+      "reason": "prior run showed TCDecoder Conv2d quantization is major quality-loss source; exclude from default DiT PTQ"
+    },
+    {
+      "id": "lq_proj_in",
+      "status": "optional_sensitivity",
+      "module_match": ["LQ_proj_in.*"],
+      "op_types": ["Conv3d", "Linear"],
+      "reason": "low measured impact but outside current DiT-only quantization scope"
+    },
+    {
+      "id": "wan_vae",
+      "status": "excluded",
+      "module_match": ["vae.*"],
+      "op_types": ["Conv2d", "Conv3d", "Linear"],
+      "reason": "user-confirmed scope: Wan VAE stays unquantized"
+    }
+  ],
+  "feature_dump_points": [
+    {"name": "text_embedding output", "pattern": "text_embedding", "capture": "output", "priority": 1},
+    {"name": "time_projection output", "pattern": "time_projection", "capture": "output", "priority": 1},
+    {"name": "early self-attn q output", "pattern": "blocks.0.self_attn.q", "capture": "output", "priority": 1},
+    {"name": "middle self-attn q output", "pattern": "blocks.15.self_attn.q", "capture": "output", "priority": 2},
+    {"name": "late self-attn q output", "pattern": "blocks.29.self_attn.q", "capture": "output", "priority": 2},
+    {"name": "early ffn output", "pattern": "blocks.0.ffn.2", "capture": "output", "priority": 2},
+    {"name": "middle ffn output", "pattern": "blocks.15.ffn.2", "capture": "output", "priority": 2},
+    {"name": "head output", "pattern": "head.head", "capture": "output", "priority": 1}
+  ]
+}

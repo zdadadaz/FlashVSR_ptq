@@ -47,6 +47,7 @@ class FakeQuantLinear(nn.Module):
         out_features: int,
         activation_mode: str = "a16",   # "a16" or "a8"
         weight_mode: str = "w8",         # "w8" or "w4"
+        act_quant_enabled: bool = True,
         bias: bool = True,
         device=None,
         dtype=None,
@@ -56,6 +57,10 @@ class FakeQuantLinear(nn.Module):
         self.out_features = out_features
         self.activation_mode = activation_mode   # "a16" or "a8"
         self.weight_mode = weight_mode         # "w8" or "w4"
+        self.register_buffer(
+            "act_quant_enabled",
+            torch.tensor(bool(act_quant_enabled), dtype=torch.bool, device=device),
+        )
 
         # ---- Weight buffers ----
         if weight_mode == "w4":
@@ -101,7 +106,7 @@ class FakeQuantLinear(nn.Module):
         orig_dtype = x.dtype
 
         # ---- (1) Activation quantization → int8 → float32 ----
-        if self.activation_mode == "a8":
+        if self.activation_mode == "a8" and bool(self.act_quant_enabled.item()):
             # Static calibrated signed-int8 activation QDQ.
             # act_scale / act_zero_point are collected by fakequant_calibrate.py
             # and loaded by fakequant_convert.py.  Reshape dynamically so both
@@ -172,6 +177,7 @@ class FakeQuantLinear(nn.Module):
         weight_mode: str = "w8",
         act_scale: torch.Tensor = None,
         act_zero_point: torch.Tensor = None,
+        act_quant_enabled: bool = True,
         ch_axis: int = -1,   # kept for API compat, unused
     ):
         """
@@ -193,6 +199,7 @@ class FakeQuantLinear(nn.Module):
             linear_module.out_features,
             activation_mode=activation_mode,
             weight_mode=weight_mode,
+            act_quant_enabled=act_quant_enabled,
             bias=linear_module.bias is not None,
             device=device,
             dtype=linear_module.weight.dtype,
@@ -403,6 +410,7 @@ def convert_model_to_fakequant(
     act_stats: dict = None,
     ch_axis: int = -1,
     method: str = "max",
+    static_quality_policy: str = "none",
 ):
     """
     Recursively replace nn.Linear → FakeQuantLinear.
@@ -413,6 +421,11 @@ def convert_model_to_fakequant(
         act_stats: calibration dict {name: {'act_scale': tensor, 'zero_point': tensor}}
         ch_axis: (unused, kept for API compat)
         method: weight quantization method (only "max" currently)
+        static_quality_policy: "none", "sensitive_a16", or "self_attn_only_a8".
+            Non-"none" policies keep structurally A8W8 modules but disable
+            activation QDQ for selected sensitive Linear layers, so checkpoints
+            still reload through the normal FakeQuant_A8W8 path while using
+            A16W8 behavior for those activations.
     """
     if mode.startswith("a16"):
         activation_mode = "a16"
@@ -428,6 +441,28 @@ def convert_model_to_fakequant(
     converted = 0
     fallback = 0
     missing_act_stats = []
+    act_disabled = 0
+
+    def should_disable_activation_quant(full_name: str) -> bool:
+        if static_quality_policy in (None, "", "none"):
+            return False
+        if static_quality_policy not in ("sensitive_a16", "self_attn_only_a8"):
+            raise ValueError(f"Unsupported static_quality_policy: {static_quality_policy}")
+        if static_quality_policy == "self_attn_only_a8":
+            return ".self_attn." not in full_name
+        sensitive_prefixes = (
+            "text_embedding.",
+            "time_embedding.",
+            "time_projection.",
+            "head.head",
+        )
+        if full_name.startswith(sensitive_prefixes):
+            return True
+        # Static activation min/max is especially brittle around DiT FFN GELU
+        # tails; keep FFN activations in fp16 while retaining int8 weights.
+        if ".ffn." in full_name:
+            return True
+        return False
 
     def get_parent_and_name(mod, full_name):
         parts = full_name.rsplit(".", 1)
@@ -463,17 +498,21 @@ def convert_model_to_fakequant(
             continue
 
         try:
+            disable_act_q = activation_mode == "a8" and should_disable_activation_quant(full_name)
             new_mod = FakeQuantLinear.from_float(
                 module,
                 activation_mode=activation_mode,
                 weight_mode=weight_mode,
                 act_scale=act_scale,
                 act_zero_point=act_zp,
+                act_quant_enabled=not disable_act_q,
                 ch_axis=ch_axis,
             )
             parent, leaf_name = get_parent_and_name(model, full_name)
             setattr(parent, leaf_name, new_mod)
             converted += 1
+            if disable_act_q:
+                act_disabled += 1
         except Exception as e:
             print(f"  [FakeQuant] Failed to convert {full_name}: {e}")
             fallback += 1
@@ -486,7 +525,10 @@ def convert_model_to_fakequant(
             f"Linear layer; missing {len(missing_act_stats)} layer(s): {preview}{suffix}"
         )
 
-    print(f"[FakeQuant] {mode}: {converted} converted, {fallback} fallback (unchanged)")
+    print(
+        f"[FakeQuant] {mode}: {converted} converted, {fallback} fallback (unchanged), "
+        f"act_q_disabled={act_disabled}, static_quality_policy={static_quality_policy}"
+    )
     return model
 
 

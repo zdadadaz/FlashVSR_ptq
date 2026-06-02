@@ -112,6 +112,16 @@ def main():
         choices=["a16w8", "a8w8", "a16w4", "a8w4"],
         help="Quantization mode"
     )
+    parser.add_argument(
+        "--static_quality_policy", type=str, default="none",
+        choices=["none", "sensitive_a16", "self_attn_only_a8"],
+        help=(
+            "Static PTQ quality policy. 'sensitive_a16' keeps A8W8 checkpoint "
+            "structure but disables activation QDQ for text/time/projection/head/FFN "
+            "layers. 'self_attn_only_a8' keeps static A8 activation QDQ only on "
+            "self-attention projections. Both preserve int8 weights."
+        ),
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -143,6 +153,7 @@ def main():
         model,
         mode=args.mode,
         act_stats=act_stats,
+        static_quality_policy=args.static_quality_policy,
     )
 
     # ------------------------------------------------------------------
@@ -161,6 +172,15 @@ def main():
     total_params = sum(1 for v in sd.values() if torch.is_floating_point(v))
     print(f"\n[Convert] Saved → {args.output}")
     print(f"[Convert] Total tensors: {len(sd)}  float={total_params}  int={total_int}")
+    disabled = sum(
+        1 for k, v in sd.items()
+        if k.endswith("act_quant_enabled") and hasattr(v, "item") and not bool(v.item())
+    )
+    enabled = sum(
+        1 for k, v in sd.items()
+        if k.endswith("act_quant_enabled") and hasattr(v, "item") and bool(v.item())
+    )
+    print(f"[Convert] act_quant_enabled: enabled={enabled} disabled={disabled}")
 
 
 if __name__ == "__main__":

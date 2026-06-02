@@ -48,6 +48,7 @@ class FakeQuantLinear(nn.Module):
         activation_mode: str = "a16",   # "a16" or "a8"
         weight_mode: str = "w8",         # "w8" or "w4"
         act_quant_enabled: bool = True,
+        activation_qdq_mode: str = "static_asymmetric",
         bias: bool = True,
         device=None,
         dtype=None,
@@ -60,6 +61,17 @@ class FakeQuantLinear(nn.Module):
         self.register_buffer(
             "act_quant_enabled",
             torch.tensor(bool(act_quant_enabled), dtype=torch.bool, device=device),
+        )
+        qdq_mode_to_id = {
+            "static_asymmetric": 0,
+            "dynamic_symmetric": 1,
+            "dynamic_asymmetric": 2,
+        }
+        if activation_qdq_mode not in qdq_mode_to_id:
+            raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
+        self.register_buffer(
+            "activation_qdq_mode",
+            torch.tensor(qdq_mode_to_id[activation_qdq_mode], dtype=torch.int32, device=device),
         )
 
         # ---- Weight buffers ----
@@ -107,19 +119,35 @@ class FakeQuantLinear(nn.Module):
 
         # ---- (1) Activation quantization → int8 → float32 ----
         if self.activation_mode == "a8" and bool(self.act_quant_enabled.item()):
-            # Static calibrated signed-int8 activation QDQ.
-            # act_scale / act_zero_point are collected by fakequant_calibrate.py
-            # and loaded by fakequant_convert.py.  Reshape dynamically so both
-            # 2D inputs [B,C] and sequence inputs [B,L,C] broadcast correctly.
             x_float = x.detach().to(torch.float32)
-            x_scale = self.act_scale.to(device=x.device, dtype=torch.float32).reshape(
-                *([1] * (x.dim() - 1)), self.in_features
-            ).clamp(min=1e-6)
-            x_zero_point = self.act_zero_point.to(device=x.device, dtype=torch.float32).reshape(
-                *([1] * (x.dim() - 1)), self.in_features
-            )
-            x_q = torch.clamp(torch.round(x_float / x_scale + x_zero_point), -128, 127).to(torch.int8)
-            x_fp = (x_q.to(torch.float32) - x_zero_point) * x_scale
+            qdq_mode = int(self.activation_qdq_mode.item())
+            if qdq_mode == 1:
+                # Dynamic per-token symmetric signed-int8 activation QDQ.
+                x_scale = torch.amax(torch.abs(x_float), dim=-1, keepdim=True).clamp(min=1e-6) / 127.0
+                x_q = torch.clamp(torch.round(x_float / x_scale), -127, 127).to(torch.int8)
+                x_fp = x_q.to(torch.float32) * x_scale
+            elif qdq_mode == 2:
+                # Dynamic per-token asymmetric signed-int8 activation QDQ.
+                qmin, qmax = -128.0, 127.0
+                x_min = torch.amin(x_float, dim=-1, keepdim=True)
+                x_max = torch.amax(x_float, dim=-1, keepdim=True)
+                x_scale = ((x_max - x_min) / (qmax - qmin)).clamp(min=1e-6)
+                x_zero_point = torch.round(qmin - x_min / x_scale).clamp(qmin, qmax)
+                x_q = torch.clamp(torch.round(x_float / x_scale + x_zero_point), qmin, qmax).to(torch.int8)
+                x_fp = (x_q.to(torch.float32) - x_zero_point) * x_scale
+            else:
+                # Static calibrated signed-int8 activation QDQ.
+                # act_scale / act_zero_point are collected by fakequant_calibrate.py
+                # and loaded by fakequant_convert.py.  Reshape dynamically so both
+                # 2D inputs [B,C] and sequence inputs [B,L,C] broadcast correctly.
+                x_scale = self.act_scale.to(device=x.device, dtype=torch.float32).reshape(
+                    *([1] * (x.dim() - 1)), self.in_features
+                ).clamp(min=1e-6)
+                x_zero_point = self.act_zero_point.to(device=x.device, dtype=torch.float32).reshape(
+                    *([1] * (x.dim() - 1)), self.in_features
+                )
+                x_q = torch.clamp(torch.round(x_float / x_scale + x_zero_point), -128, 127).to(torch.int8)
+                x_fp = (x_q.to(torch.float32) - x_zero_point) * x_scale
         else:
             # a16: no-op, just promote to float for matmul
             x_fp = x.float()
@@ -178,6 +206,7 @@ class FakeQuantLinear(nn.Module):
         act_scale: torch.Tensor = None,
         act_zero_point: torch.Tensor = None,
         act_quant_enabled: bool = True,
+        activation_qdq_mode: str = "static_asymmetric",
         ch_axis: int = -1,   # kept for API compat, unused
     ):
         """
@@ -200,6 +229,7 @@ class FakeQuantLinear(nn.Module):
             activation_mode=activation_mode,
             weight_mode=weight_mode,
             act_quant_enabled=act_quant_enabled,
+            activation_qdq_mode=activation_qdq_mode,
             bias=linear_module.bias is not None,
             device=device,
             dtype=linear_module.weight.dtype,
@@ -411,6 +441,7 @@ def convert_model_to_fakequant(
     ch_axis: int = -1,
     method: str = "max",
     static_quality_policy: str = "none",
+    activation_qdq_mode: str = "static_asymmetric",
 ):
     """
     Recursively replace nn.Linear → FakeQuantLinear.
@@ -426,7 +457,13 @@ def convert_model_to_fakequant(
             activation QDQ for selected sensitive Linear layers, so checkpoints
             still reload through the normal FakeQuant_A8W8 path while using
             A16W8 behavior for those activations.
+        activation_qdq_mode: "static_asymmetric", "dynamic_symmetric", or
+            "dynamic_asymmetric" for A8 activation QDQ. Dynamic modes compute
+            activation scale/zero-point at runtime per token and do not require
+            static calibration stats for activation math.
     """
+    if activation_qdq_mode not in ("static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"):
+        raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
     if mode.startswith("a16"):
         activation_mode = "a16"
         weight_mode = mode[3:]
@@ -493,7 +530,12 @@ def convert_model_to_fakequant(
                 if act_scale is None:
                     act_scale = s.get("act_scale", None)
                 act_zp = s.get("zero_point", None)
-        if activation_mode == "a8" and act_stats is not None and act_scale is None:
+        if (
+            activation_mode == "a8"
+            and activation_qdq_mode == "static_asymmetric"
+            and act_stats is not None
+            and act_scale is None
+        ):
             missing_act_stats.append(full_name)
             continue
 
@@ -506,6 +548,7 @@ def convert_model_to_fakequant(
                 act_scale=act_scale,
                 act_zero_point=act_zp,
                 act_quant_enabled=not disable_act_q,
+                activation_qdq_mode=activation_qdq_mode,
                 ch_axis=ch_axis,
             )
             parent, leaf_name = get_parent_and_name(model, full_name)
@@ -527,7 +570,8 @@ def convert_model_to_fakequant(
 
     print(
         f"[FakeQuant] {mode}: {converted} converted, {fallback} fallback (unchanged), "
-        f"act_q_disabled={act_disabled}, static_quality_policy={static_quality_policy}"
+        f"act_q_disabled={act_disabled}, static_quality_policy={static_quality_policy}, "
+        f"activation_qdq_mode={activation_qdq_mode}"
     )
     return model
 

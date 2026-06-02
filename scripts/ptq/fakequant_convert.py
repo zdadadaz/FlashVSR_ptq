@@ -122,6 +122,15 @@ def main():
             "self-attention projections. Both preserve int8 weights."
         ),
     )
+    parser.add_argument(
+        "--activation_qdq_mode", type=str, default="static_asymmetric",
+        choices=["static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"],
+        help=(
+            "A8 activation QDQ policy. static_asymmetric uses calibrated per-channel "
+            "scale/zero_point from --calibration_cache. dynamic_symmetric and "
+            "dynamic_asymmetric compute per-token activation scales at runtime."
+        ),
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -139,10 +148,10 @@ def main():
     if args.calibration_cache:
         act_stats = load_calibration_cache(args.calibration_cache)
         print(f"[Convert] Loaded calibration for {len(act_stats)} layers")
-    if args.mode.startswith("a8") and not act_stats:
+    if args.mode.startswith("a8") and args.activation_qdq_mode == "static_asymmetric" and not act_stats:
         raise RuntimeError(
-            f"Mode {args.mode} requires a non-empty --calibration_cache with "
-            "calibrated act_scale and zero_point entries."
+            f"Mode {args.mode} with static_asymmetric activation QDQ requires a non-empty "
+            "--calibration_cache with calibrated act_scale and zero_point entries."
         )
 
     # ------------------------------------------------------------------
@@ -154,6 +163,7 @@ def main():
         mode=args.mode,
         act_stats=act_stats,
         static_quality_policy=args.static_quality_policy,
+        activation_qdq_mode=args.activation_qdq_mode,
     )
 
     # ------------------------------------------------------------------

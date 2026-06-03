@@ -33,6 +33,8 @@ from src.models.quantization.policy import load_layer_policy, layer_policy_entri
 from src.models.quantization.qat import (
     convert_model_to_qat,
     export_qat_model_to_fakequant,
+    freeze_qat_observers,
+    set_qat_observer,
     temporal_consistency_loss,
     tensor_psnr,
     update_ema_model,
@@ -137,6 +139,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         layer_policy=layer_policy,
     )
     print(f"[QAT] Conversion summary: {getattr(student, '_qat_conversion_summary', {})}")
+    observer_summary: dict[str, Any] = {"enabled": False, "freeze_step": int(args.observer_freeze_step)}
+    use_static_observer = args.activation_qdq_mode == "static_asymmetric" and not args.calibration_cache and args.observer_freeze_step >= 0
+    if use_static_observer:
+        set_qat_observer(student, True, ema_decay=args.observer_ema_decay)
+        observer_summary["enabled"] = True
+        observer_summary["ema_decay"] = float(args.observer_ema_decay)
 
     ema_student = deepcopy(student).eval() if args.ema_decay > 0 else None
     optim = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
@@ -176,6 +184,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             if ema_student is not None:
                 update_ema_model(ema_student, student, args.ema_decay)
 
+            if use_static_observer and step + 1 == args.observer_freeze_step:
+                observer_summary["student"] = freeze_qat_observers(student)
+                if ema_student is not None:
+                    observer_summary["ema"] = freeze_qat_observers(ema_student)
+                print(f"[QAT] Froze static activation observers at step={step+1}: {observer_summary}")
+
             with torch.no_grad():
                 psnr = tensor_psnr(student_out, teacher_out, data_range=args.data_range)
             last_metrics = {
@@ -191,6 +205,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             step += 1
 
     export_source = ema_student if ema_student is not None else student
+    if use_static_observer:
+        final_freeze = freeze_qat_observers(export_source)
+        observer_summary["export_source_final_freeze"] = final_freeze
     fakequant_model = export_qat_model_to_fakequant(export_source, inplace=False)
     qat_path = output_dir / "flashvsr_v1.1_qat_trainable.pt"
     fq_path = output_dir / "flashvsr_v1.1_qat_fakequant.pt"
@@ -207,6 +224,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "steps": args.steps,
         "lr": args.lr,
         "ema_decay": args.ema_decay,
+        "observer": observer_summary,
         "last_metrics": last_metrics,
         "psnr_gate": "Run fixed eval set and compare against FP16 teacher; target drop <= %.2f dB" % args.target_psnr_drop_db,
     }
@@ -231,6 +249,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--observer_ema_decay", type=float, default=0.95)
+    parser.add_argument("--observer_freeze_step", type=int, default=-1, help="For static_asymmetric QAT, collect observer stats until this 1-indexed step then freeze. -1 disables observer warmup.")
     parser.add_argument("--temporal_loss_weight", type=float, default=0.05)
     parser.add_argument("--target_loss_weight", type=float, default=0.0)
     parser.add_argument("--target_psnr_drop_db", type=float, default=0.4)

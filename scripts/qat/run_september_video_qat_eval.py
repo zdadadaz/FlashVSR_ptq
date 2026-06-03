@@ -82,11 +82,22 @@ def main() -> None:
     parser.add_argument("--output_root", default=str(ROOT / "outputs" / "qat" / "2026-09-personA"))
     parser.add_argument("--max_train_videos", type=int, default=16)
     parser.add_argument("--prepare_frames", type=int, default=4)
+    parser.add_argument("--downsample_lq_scale", type=int, default=4)
+    parser.add_argument("--latent_source", default="pseudo", choices=["pseudo", "vae"])
+    parser.add_argument("--context_source", default="deterministic", choices=["deterministic", "teacher_text_embedding"])
+    parser.add_argument("--prompt_context_path", default=str(ROOT / "posi_prompt.pth"))
+    parser.add_argument("--context_checkpoint", default="", help="Defaults to --checkpoint for teacher_text_embedding context")
+    parser.add_argument("--vae_path", default="")
+    parser.add_argument("--vae_model", default="Wan2.1")
+    parser.add_argument("--tiled_vae", action="store_true")
     parser.add_argument("--latent_size", default="16x16")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--smoke_steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--policy_json", default="", help="Optional per-layer QAT policy JSON, e.g. mixed static A8W8/A16W8")
+    parser.add_argument("--observer_ema_decay", type=float, default=0.95)
+    parser.add_argument("--observer_freeze_step", type=int, default=-1)
     parser.add_argument("--mode", default="a8w8", choices=["a8w8", "a16w8", "a8w4", "a16w4"])
     parser.add_argument("--activation_qdq_mode", default="dynamic_asymmetric", choices=["static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"])
     parser.add_argument("--eval_end_frame", type=int, default=16)
@@ -113,7 +124,16 @@ def main() -> None:
         "--max_videos", str(args.max_train_videos),
         "--frames", str(args.prepare_frames),
         "--latent_size", args.latent_size,
+        "--downsample_lq_scale", str(args.downsample_lq_scale),
+        "--latent_source", args.latent_source,
+        "--context_source", args.context_source,
+        "--prompt_context_path", args.prompt_context_path,
+        "--context_checkpoint", args.context_checkpoint or args.checkpoint,
     ]
+    if args.vae_path:
+        prepare_cmd.extend(["--vae_path", args.vae_path, "--vae_model", args.vae_model])
+    if args.tiled_vae:
+        prepare_cmd.append("--tiled_vae")
     run(prepare_cmd, logs / "prepare_manifest.log", dry_run=args.dry_run)
 
     qat_steps = args.smoke_steps if args.smoke else args.steps
@@ -128,12 +148,16 @@ def main() -> None:
         "--steps", str(qat_steps),
         "--lr", str(args.lr),
         "--ema_decay", str(args.ema_decay),
+        "--observer_ema_decay", str(args.observer_ema_decay),
+        "--observer_freeze_step", str(args.observer_freeze_step),
         "--temporal_loss_weight", "0.05",
         "--target_psnr_drop_db", str(args.target_psnr_drop_db),
         "--gradient_checkpointing",
         "--dtype", "bf16",
         "--device", "cuda" if not args.smoke else "cuda",
     ]
+    if args.policy_json:
+        qat_cmd.extend(["--policy_json", args.policy_json])
     run(qat_cmd, logs / "qat_train.log", dry_run=args.dry_run)
 
     fakequant_ckpt = qat_out / "flashvsr_v1.1_qat_fakequant.pt"

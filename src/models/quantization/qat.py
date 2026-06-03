@@ -131,9 +131,17 @@ class QuantAwareLinear(nn.Module):
         if activation_mode == "a8":
             self.register_buffer("act_scale", torch.ones(1, 1, in_features, dtype=torch.float32, device=device))
             self.register_buffer("act_zero_point", torch.zeros(1, 1, in_features, dtype=torch.int32, device=device))
+            self.register_buffer("observer_min", torch.zeros(1, 1, in_features, dtype=torch.float32, device=device))
+            self.register_buffer("observer_max", torch.zeros(1, 1, in_features, dtype=torch.float32, device=device))
         else:
             self.register_buffer("act_scale", None)
             self.register_buffer("act_zero_point", None)
+            self.register_buffer("observer_min", None)
+            self.register_buffer("observer_max", None)
+        self.register_buffer("observer_enabled", torch.tensor(False, dtype=torch.bool, device=device))
+        self.register_buffer("observer_initialized", torch.tensor(False, dtype=torch.bool, device=device))
+        self.register_buffer("static_qparams_frozen", torch.tensor(False, dtype=torch.bool, device=device))
+        self.register_buffer("observer_ema_decay", torch.tensor(0.95, dtype=torch.float32, device=device))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -191,7 +199,53 @@ class QuantAwareLinear(nn.Module):
             else:
                 self.act_zero_point.copy_(zp)
 
+    def enable_observer(self, enabled: bool = True, ema_decay: float = 0.95) -> None:
+        """Enable/disable EMA activation min/max collection for static QAT."""
+
+        self.observer_enabled.fill_(bool(enabled))
+        self.observer_ema_decay.fill_(float(ema_decay))
+
+    def update_activation_observer(self, x: torch.Tensor) -> None:
+        """Update per-input-channel EMA min/max over all dimensions except feature."""
+
+        if self.activation_mode != "a8" or self.observer_min is None or self.observer_max is None:
+            return
+        with torch.no_grad():
+            x_float = x.detach().to(torch.float32)
+            reduce_dims = tuple(range(x_float.dim() - 1))
+            cur_min = torch.amin(x_float, dim=reduce_dims).reshape(1, 1, self.in_features)
+            cur_max = torch.amax(x_float, dim=reduce_dims).reshape(1, 1, self.in_features)
+            if not bool(self.observer_initialized.item()):
+                self.observer_min.copy_(cur_min.to(device=self.observer_min.device))
+                self.observer_max.copy_(cur_max.to(device=self.observer_max.device))
+                self.observer_initialized.fill_(True)
+                return
+            decay = float(self.observer_ema_decay.item())
+            self.observer_min.mul_(decay).add_(cur_min.to(device=self.observer_min.device), alpha=1.0 - decay)
+            self.observer_max.mul_(decay).add_(cur_max.to(device=self.observer_max.device), alpha=1.0 - decay)
+
+    def freeze_activation_qparams(self) -> None:
+        """Freeze static asymmetric activation scale/zero-point from observer stats."""
+
+        if self.activation_mode != "a8" or self.act_scale is None or self.act_zero_point is None:
+            self.observer_enabled.fill_(False)
+            self.static_qparams_frozen.fill_(True)
+            return
+        if not bool(self.observer_initialized.item()):
+            raise RuntimeError("Cannot freeze activation qparams before observer has collected stats")
+        qmin, qmax = -128.0, 127.0
+        obs_min = self.observer_min.to(device=self.act_scale.device, dtype=torch.float32)
+        obs_max = self.observer_max.to(device=self.act_scale.device, dtype=torch.float32)
+        scale = ((obs_max - obs_min) / (qmax - qmin)).clamp(min=1e-6)
+        zero_point = torch.round(qmin - obs_min / scale).clamp(qmin, qmax).to(torch.int32)
+        self.act_scale.copy_(scale)
+        self.act_zero_point.copy_(zero_point)
+        self.observer_enabled.fill_(False)
+        self.static_qparams_frozen.fill_(True)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if bool(self.observer_enabled.item()) and self.activation_qdq_mode_name == "static_asymmetric":
+            self.update_activation_observer(x)
         if bool(self.act_quant_enabled.item()):
             x_qdq = quant_dequant_activation_ste(
                 x,
@@ -318,6 +372,34 @@ def set_qat_activation_quant(model: nn.Module, enabled: bool) -> None:
     for module in model.modules():
         if isinstance(module, QuantAwareLinear):
             module.act_quant_enabled.fill_(bool(enabled))
+
+
+def set_qat_observer(model: nn.Module, enabled: bool, ema_decay: float = 0.95) -> None:
+    """Enable/disable static activation observers for all QAT Linear layers."""
+
+    for module in model.modules():
+        if isinstance(module, QuantAwareLinear):
+            module.enable_observer(enabled, ema_decay=ema_decay)
+
+
+def freeze_qat_observers(model: nn.Module) -> dict[str, int]:
+    """Freeze all initialized static QAT observers and return a summary."""
+
+    summary = {"frozen": 0, "skipped_uninitialized": 0, "non_qat": 0}
+    for module in model.modules():
+        if not isinstance(module, QuantAwareLinear):
+            continue
+        if module.activation_mode != "a8":
+            summary["non_qat"] += 1
+            module.enable_observer(False)
+            continue
+        if not bool(module.observer_initialized.item()):
+            summary["skipped_uninitialized"] += 1
+            module.enable_observer(False)
+            continue
+        module.freeze_activation_qparams()
+        summary["frozen"] += 1
+    return summary
 
 
 def update_ema_model(ema_model: nn.Module, model: nn.Module, decay: float) -> None:

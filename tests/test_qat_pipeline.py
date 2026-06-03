@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from scripts.qat.finetune_fakequant_dit import LatentManifestDataset, move_sample
 from scripts.qat.prepare_video_manifest import deterministic_context, frames_to_pseudo_latent
+from scripts.qat.run_september_video_qat_eval import compute_gt_drop_row, resolve_gt_clip
 from src.models.quantization.fakequant import FakeQuantLinear
 from src.models.quantization.qat import (
     QuantAwareLinear,
@@ -187,3 +188,27 @@ def test_cross_attention_offline_context_matches_module_dtype():
 
     assert out.shape == x.shape
     assert out.dtype == torch.bfloat16
+
+
+def test_resolve_gt_clip_accepts_named_and_original_filenames(tmp_path):
+    gt_dir = tmp_path / "gt"
+    gt_dir.mkdir()
+    original = gt_dir / "bowing_cif.mp4"
+    named = gt_dir / "bowing.mp4"
+    original.write_text("original")
+    named.write_text("named")
+
+    assert resolve_gt_clip(gt_dir, "bowing", "bowing_cif.mp4") == named
+    named.unlink()
+    assert resolve_gt_clip(gt_dir, "bowing", "bowing_cif.mp4") == original
+
+
+def test_compute_gt_drop_row_reports_fp16_minus_qat_drop():
+    fp16_metric = {"psnr_avg_db": 31.25, "frames": 16}
+    qat_metric = {"psnr_avg_db": 30.9, "frames": 16}
+
+    row = compute_gt_drop_row("bowing", fp16_metric, qat_metric, threshold=0.4)
+
+    assert row["clip"] == "bowing"
+    assert abs(row["psnr_drop_db"] - 0.35) < 1e-6
+    assert row["passes_threshold"] is True

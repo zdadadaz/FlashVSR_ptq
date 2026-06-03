@@ -69,7 +69,7 @@ class LatentManifestDataset(Dataset):
         row = self.rows[idx]
         if "sample" in row:
             path = Path(row["sample"])
-            if not path.is_absolute():
+            if not path.is_absolute() and not path.exists():
                 path = self.manifest.parent / path
             sample = torch.load(path, map_location="cpu", weights_only=False)
         else:
@@ -87,12 +87,14 @@ def collate_batch(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tenso
     return batch[0]
 
 
-def move_sample(sample: dict[str, torch.Tensor], device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
-    out = {}
+def move_sample(sample: dict[str, Any], device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
     for key, value in sample.items():
-        if key == "timestep":
-            out[key] = value.to(device=device)
-        elif torch.is_floating_point(value):
+        if not isinstance(value, torch.Tensor):
+            # Manifest samples may carry metadata such as source_video; keep only
+            # tensors needed by WanModel.forward / optional target loss.
+            continue
+        if torch.is_floating_point(value):
             out[key] = value.to(device=device, dtype=dtype)
         else:
             out[key] = value.to(device=device)

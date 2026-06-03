@@ -3,6 +3,8 @@ import copy
 import torch
 import torch.nn as nn
 
+from scripts.qat.finetune_fakequant_dit import LatentManifestDataset, move_sample
+from scripts.qat.prepare_video_manifest import deterministic_context, frames_to_pseudo_latent
 from src.models.quantization.fakequant import FakeQuantLinear
 from src.models.quantization.qat import (
     QuantAwareLinear,
@@ -14,6 +16,7 @@ from src.models.quantization.qat import (
     tensor_psnr,
     update_ema_model,
 )
+from src.models.wan_video_dit import CrossAttention
 
 
 class TinyWanLike(nn.Module):
@@ -124,3 +127,63 @@ def test_psnr_and_temporal_consistency_helpers():
     assert psnr.item() > 0
     assert temporal.item() > 0
     assert temporal_consistency_loss(torch.zeros(1, 4), torch.zeros(1, 4)).item() == 0.0
+
+
+def test_video_frames_convert_to_dit_ready_pseudo_latent_and_context():
+    frames = torch.linspace(0, 1, steps=4 * 16 * 16 * 3).reshape(4, 16, 16, 3).numpy()
+
+    latent = frames_to_pseudo_latent(frames)
+    ctx_a = deterministic_context(0)
+    ctx_b = deterministic_context(0)
+
+    assert latent.shape == (1, 16, 4, 16, 16)
+    assert latent.dtype == torch.float32
+    assert latent.min().item() < 0
+    assert latent.max().item() > 0
+    assert ctx_a.shape == (1, 10, 1536)
+    assert torch.allclose(ctx_a, ctx_b)
+
+
+def test_latent_manifest_dataset_accepts_repo_relative_sample_paths(tmp_path):
+    sample_dir = tmp_path / "samples"
+    sample_dir.mkdir()
+    sample_path = sample_dir / "sample.pt"
+    torch.save({
+        "x": torch.zeros(1, 16, 4, 16, 16),
+        "timestep": torch.tensor([1000.0]),
+        "context": torch.zeros(1, 10, 1536),
+    }, sample_path)
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"sample": "' + str(sample_path) + '"}\n')
+
+    dataset = LatentManifestDataset(manifest)
+
+    assert dataset[0]["x"].shape == (1, 16, 4, 16, 16)
+
+
+def test_move_sample_skips_manifest_metadata_strings():
+    sample = {
+        "x": torch.zeros(1, 16, 4, 16, 16),
+        "timestep": torch.tensor([1000.0]),
+        "context": torch.zeros(1, 10, 1536),
+        "source_video": "datasets/train/example.mp4",
+    }
+
+    moved = move_sample(sample, torch.device("cpu"), torch.bfloat16)
+
+    assert set(moved) == {"x", "timestep", "context"}
+    assert moved["x"].dtype == torch.bfloat16
+    assert moved["context"].dtype == torch.bfloat16
+    assert moved["timestep"].dtype == torch.bfloat16
+
+
+def test_cross_attention_offline_context_matches_module_dtype():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    attn = CrossAttention(dim=128, num_heads=2).to(device=device, dtype=torch.bfloat16)
+    x = torch.zeros(1, 4, 128, device=device, dtype=torch.bfloat16)
+    context = torch.zeros(1, 3, 128, device=device, dtype=torch.bfloat16)
+
+    out = attn(x, context)
+
+    assert out.shape == x.shape
+    assert out.dtype == torch.bfloat16

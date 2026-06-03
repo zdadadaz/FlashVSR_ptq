@@ -495,10 +495,11 @@ class CrossAttention(nn.Module):
             v = self.cache_v
         else:
             # Calibration / offline mode: compute K,V from provided context y directly.
-            # Cast y to float to avoid bf16/float matmul mismatch in linear layers.
-            y_float = y.to(torch.float32)
-            k = self.norm_k(self.k(y_float))
-            v = self.v(y_float)
+            # Match the projection dtype so bf16/fp16 QAT/inference does not hit
+            # mixed dtype matmul errors.
+            y_proj = y.to(dtype=self.k.weight.dtype)
+            k = self.norm_k(self.k(y_proj))
+            v = self.v(y_proj)
             # Return in same dtype as q for attention computation
             k = k.to(dtype=q.dtype)
             v = v.to(dtype=q.dtype)

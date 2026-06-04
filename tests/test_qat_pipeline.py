@@ -16,6 +16,7 @@ from scripts.qat.prepare_video_manifest import (
     write_manifest_from_videos,
 )
 from scripts.qat.run_september_video_qat_eval import compute_gt_drop_row, resolve_gt_clip
+from scripts.qat.static_diagnostic_runner import collect_static_linear_diagnostics, write_diagnostic_outputs
 from src.models.quantization.fakequant import FakeQuantLinear
 from src.models.quantization.qat import (
     QuantAwareLinear,
@@ -142,6 +143,33 @@ def test_freeze_qat_observers_freezes_static_layers_and_export_preserves_static_
     assert isinstance(exported.text_embedding[0], FakeQuantLinear)
     assert int(exported.text_embedding[0].activation_qdq_mode.item()) == 0
     assert torch.count_nonzero(exported.text_embedding[0].act_zero_point).item() > 0
+
+
+def test_static_diagnostic_runner_ranks_bad_layers_and_writes_outputs(tmp_path):
+    model = TinyWanLike()
+    convert_model_to_qat(model, mode="a8w8", activation_qdq_mode="static_asymmetric")
+    # Deliberately make one layer's static activation qparams poor so the
+    # diagnostic ranking has a deterministic worst layer.
+    model.blocks[0]["self_attn"]["q"].act_scale.fill_(10.0)
+    model.blocks[0]["self_attn"]["q"].act_zero_point.zero_()
+
+    rows = collect_static_linear_diagnostics(
+        model,
+        [{"input": torch.randn(2, 3, 4)}],
+        device="cpu",
+        dtype=torch.float32,
+    )
+    paths = write_diagnostic_outputs(rows, tmp_path, top_k=2)
+
+    assert len(rows) == 5
+    assert rows[0]["name"] == "blocks.0.self_attn.q"
+    assert rows[0]["output_mse"] > 0
+    assert "sqnr_db" in rows[0]
+    assert "activation_min" in rows[0]
+    assert (tmp_path / "static_qat_linear_diagnostics.json").exists()
+    assert (tmp_path / "static_qat_linear_diagnostics.csv").exists()
+    assert "blocks.0.self_attn.q" in (tmp_path / "static_qat_linear_top20.md").read_text()
+    assert set(paths) == {"json", "csv", "markdown"}
 
 
 def test_ema_update_tracks_float_params_and_copies_integer_buffers():

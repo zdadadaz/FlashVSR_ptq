@@ -49,6 +49,7 @@ class FakeQuantLinear(nn.Module):
         weight_mode: str = "w8",         # "w8" or "w4"
         act_quant_enabled: bool = True,
         activation_qdq_mode: str = "static_asymmetric",
+        draq_qrange: str = "signed_symmetric",
         bias: bool = True,
         device=None,
         dtype=None,
@@ -73,12 +74,20 @@ class FakeQuantLinear(nn.Module):
             "static_asymmetric": 0,
             "dynamic_symmetric": 1,
             "dynamic_asymmetric": 2,
+            "draq_symmetric": 3,
         }
         if activation_qdq_mode not in qdq_mode_to_id:
             raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
         self.register_buffer(
             "activation_qdq_mode",
             torch.tensor(qdq_mode_to_id[activation_qdq_mode], dtype=torch.int32, device=device),
+        )
+        draq_qrange_to_id = {"signed_symmetric": 0, "signed_full": 1}
+        if draq_qrange not in draq_qrange_to_id:
+            raise ValueError(f"Unsupported draq_qrange: {draq_qrange}")
+        self.register_buffer(
+            "draq_qrange",
+            torch.tensor(draq_qrange_to_id[draq_qrange], dtype=torch.int32, device=device),
         )
 
         # ---- Weight buffers ----
@@ -143,6 +152,17 @@ class FakeQuantLinear(nn.Module):
                 x_zero_point = torch.round(qmin - x_min / x_scale).clamp(qmin, qmax)
                 x_q = torch.clamp(torch.round(x_float / x_scale + x_zero_point), qmin, qmax).to(torch.int8)
                 x_fp = (x_q.to(torch.float32) - x_zero_point) * x_scale
+            elif qdq_mode == 3:
+                # LSGQuant DRAQ: per-channel normalization over token-like dims,
+                # followed by per-token symmetric signed-int8 QDQ. Scales are
+                # online and do not require calibration cache entries.
+                qmin, qmax = (-128.0, 127.0) if int(self.draq_qrange.item()) == 1 else (-127.0, 127.0)
+                reduce_channel = tuple(range(x_float.dim() - 1))
+                s = torch.amax(torch.abs(x_float), dim=reduce_channel, keepdim=True).clamp(min=1e-6)
+                x_norm = x_float / s
+                d = torch.amax(torch.abs(x_norm), dim=-1, keepdim=True).clamp(min=1e-6)
+                x_q = torch.clamp(torch.round(qmax * x_norm / d), qmin, qmax).to(torch.int8)
+                x_fp = (x_q.to(torch.float32) / qmax) * d * s
             else:
                 # Static calibrated signed-int8 activation QDQ.
                 # act_scale / act_zero_point are collected by fakequant_calibrate.py
@@ -216,6 +236,7 @@ class FakeQuantLinear(nn.Module):
         act_mean: torch.Tensor = None,
         act_quant_enabled: bool = True,
         activation_qdq_mode: str = "static_asymmetric",
+        draq_qrange: str = "signed_symmetric",
         ch_axis: int = -1,   # kept for API compat, unused
     ):
         """
@@ -239,6 +260,7 @@ class FakeQuantLinear(nn.Module):
             weight_mode=weight_mode,
             act_quant_enabled=act_quant_enabled,
             activation_qdq_mode=activation_qdq_mode,
+            draq_qrange=draq_qrange,
             bias=linear_module.bias is not None,
             device=device,
             dtype=linear_module.weight.dtype,
@@ -475,6 +497,7 @@ def convert_model_to_fakequant(
     method: str = "max",
     static_quality_policy: str = "none",
     activation_qdq_mode: str = "static_asymmetric",
+    draq_qrange: str = "signed_symmetric",
     layer_policy: dict | None = None,
     enable_bias_correction: bool = False,
 ):
@@ -485,8 +508,11 @@ def convert_model_to_fakequant(
     and `fp16_skip` at per-Linear granularity while preserving the existing
     global-mode behavior when omitted.
     """
-    if activation_qdq_mode not in ("static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"):
+    supported_qdq_modes = ("static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric", "draq_symmetric")
+    if activation_qdq_mode not in supported_qdq_modes:
         raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
+    if draq_qrange not in ("signed_symmetric", "signed_full"):
+        raise ValueError(f"Unsupported draq_qrange: {draq_qrange}")
     if not (mode.startswith("a16") or mode.startswith("a8")):
         raise ValueError(f"Unsupported fakequant mode: {mode}")
     default_weight_mode = mode[3:] if mode.startswith("a16") else mode[2:]
@@ -540,7 +566,7 @@ def convert_model_to_fakequant(
             entry.get("activation_qdq_mode", activation_qdq_mode)
             if isinstance(entry, dict) else activation_qdq_mode
         )
-        if layer_qdq_mode not in ("static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"):
+        if layer_qdq_mode not in supported_qdq_modes:
             raise ValueError(f"Unsupported activation_qdq_mode for {full_name}: {layer_qdq_mode}")
         if layer_mode == "fp16_skip":
             skipped_fp16 += 1
@@ -592,6 +618,7 @@ def convert_model_to_fakequant(
                 act_mean=act_mean if enable_bias_correction else None,
                 act_quant_enabled=not disable_act_q,
                 activation_qdq_mode=layer_qdq_mode,
+                draq_qrange=draq_qrange,
                 ch_axis=ch_axis,
             )
             parent, leaf_name = get_parent_and_name(model, full_name)
@@ -620,6 +647,7 @@ def convert_model_to_fakequant(
         "mode_counts": mode_counts,
         "static_quality_policy": static_quality_policy,
         "activation_qdq_mode": activation_qdq_mode,
+        "draq_qrange": draq_qrange,
         "enable_bias_correction": enable_bias_correction,
     }
     print(

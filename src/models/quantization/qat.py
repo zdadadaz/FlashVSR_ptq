@@ -54,6 +54,7 @@ def quant_dequant_activation_ste(
     x: torch.Tensor,
     activation_mode: str = "a8",
     activation_qdq_mode: str = "dynamic_asymmetric",
+    draq_qrange: str = "signed_symmetric",
     act_scale: torch.Tensor | None = None,
     act_zero_point: torch.Tensor | None = None,
     in_features: int | None = None,
@@ -69,6 +70,19 @@ def quant_dequant_activation_ste(
     if activation_qdq_mode == "dynamic_symmetric":
         scale = torch.amax(torch.abs(x_float), dim=-1, keepdim=True).clamp(min=1e-6) / 127.0
         qdq = torch.clamp(torch.round(x_float / scale), -127, 127) * scale
+    elif activation_qdq_mode == "draq_symmetric":
+        if draq_qrange == "signed_full":
+            qmin, qmax = -128.0, 127.0
+        elif draq_qrange == "signed_symmetric":
+            qmin, qmax = -127.0, 127.0
+        else:
+            raise ValueError(f"Unsupported draq_qrange: {draq_qrange}")
+        reduce_channel = tuple(range(x_float.dim() - 1))
+        s = torch.amax(torch.abs(x_float), dim=reduce_channel, keepdim=True).clamp(min=1e-6)
+        x_norm = x_float / s
+        d = torch.amax(torch.abs(x_norm), dim=-1, keepdim=True).clamp(min=1e-6)
+        q = torch.clamp(torch.round(qmax * x_norm / d), qmin, qmax)
+        qdq = (q / qmax) * d * s
     elif activation_qdq_mode == "dynamic_asymmetric":
         qmin, qmax = -128.0, 127.0
         x_min = torch.amin(x_float, dim=-1, keepdim=True)
@@ -117,7 +131,7 @@ class QuantAwareLinear(nn.Module):
             raise ValueError(f"Unsupported activation_mode: {activation_mode}")
         if weight_mode not in ("w8", "w4"):
             raise ValueError(f"Unsupported weight_mode: {weight_mode}")
-        if activation_qdq_mode not in ("static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"):
+        if activation_qdq_mode not in ("static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric", "draq_symmetric"):
             raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
 
         self.in_features = in_features

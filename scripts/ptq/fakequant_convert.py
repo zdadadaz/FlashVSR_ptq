@@ -127,12 +127,18 @@ def main():
     )
     parser.add_argument(
         "--activation_qdq_mode", type=str, default="static_asymmetric",
-        choices=["static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"],
+        choices=["static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric", "draq_symmetric"],
         help=(
             "A8 activation QDQ policy. static_asymmetric uses calibrated per-channel "
             "scale/zero_point from --calibration_cache. dynamic_symmetric and "
-            "dynamic_asymmetric compute per-token activation scales at runtime."
+            "dynamic_asymmetric compute per-token activation scales at runtime; "
+            "draq_symmetric uses LSGQuant online channel+token scaling."
         ),
+    )
+    parser.add_argument(
+        "--draq_qrange", type=str, default="signed_symmetric",
+        choices=["signed_symmetric", "signed_full"],
+        help="DRAQ signed int8 clamp range: conservative [-127,127] or paper-style [-128,127]."
     )
     parser.add_argument(
         "--policy_json", type=str, default="",
@@ -180,6 +186,7 @@ def main():
         act_stats=act_stats,
         static_quality_policy=args.static_quality_policy,
         activation_qdq_mode=args.activation_qdq_mode,
+        draq_qrange=args.draq_qrange,
         layer_policy=layer_policy,
         enable_bias_correction=args.enable_bias_correction,
     )
@@ -216,6 +223,7 @@ def main():
         "output": args.output,
         "calibration_cache": args.calibration_cache or None,
         "policy_json": args.policy_json or None,
+        "draq_qrange": args.draq_qrange,
     })
     summary_path = f"{args.output}.conversion_summary.json"
     with open(summary_path, "w") as f:

@@ -112,7 +112,17 @@ def test_lsgquant_eval_manifest_builds_convert_command_and_records_quality_gate(
     assert cmd[:3] == [sys.executable, "scripts/ptq/fakequant_convert.py", "--checkpoint"]
     assert "--policy" in cmd
     assert "--activation_qdq_mode" in cmd and "draq_symmetric" in cmd
-    assert "--enable_bias_correction" in cmd
+    assert "--enable_bias_correction" not in cmd
+
+    bias_cmd = build_lsgquant_convert_command(
+        checkpoint=checkpoint,
+        calibration_cache=calib,
+        policy=policy,
+        mode="a8w8",
+        out_dir=out_dir,
+        enable_bias_correction=True,
+    )
+    assert "--enable_bias_correction" in bias_cmd
     assert manifest["quality_gate"]["baseline"] == "static_a8w8"
     assert manifest["quality_gate"]["metrics"] == ["psnr", "temporal_drift"]
     assert manifest["convert_command"] == cmd

@@ -32,8 +32,9 @@ def build_lsgquant_convert_command(
     policy: Path,
     mode: str,
     out_dir: Path,
+    enable_bias_correction: bool = False,
 ) -> list[str]:
-    return [
+    cmd = [
         sys.executable,
         "scripts/ptq/fakequant_convert.py",
         "--checkpoint",
@@ -46,10 +47,14 @@ def build_lsgquant_convert_command(
         mode,
         "--activation_qdq_mode",
         "draq_symmetric",
-        "--enable_bias_correction",
+    ]
+    if enable_bias_correction:
+        cmd.append("--enable_bias_correction")
+    cmd.extend([
         "--output",
         str(converted_checkpoint_path(out_dir, mode)),
-    ]
+    ])
+    return cmd
 
 
 def _cache_summary(calibration_cache: Path) -> dict[str, Any]:
@@ -72,10 +77,11 @@ def build_lsgquant_eval_manifest(
     mode: str,
     out_dir: Path,
     limit: int | None = None,
+    enable_bias_correction: bool = False,
 ) -> dict[str, Any]:
     _, policy_summary = load_lsgquant_layer_policy(policy)
     converted = converted_checkpoint_path(out_dir, mode)
-    command = build_lsgquant_convert_command(checkpoint, calibration_cache, policy, mode, out_dir)
+    command = build_lsgquant_convert_command(checkpoint, calibration_cache, policy, mode, out_dir, enable_bias_correction=enable_bias_correction)
     return {
         "schema_version": "flashvsr.lsgquant.eval_manifest.v1",
         "paper": "arXiv:2602.03182v1",
@@ -87,7 +93,7 @@ def build_lsgquant_eval_manifest(
         "policy_summary": policy_summary,
         "mode": mode,
         "activation_qdq_mode": "draq_symmetric",
-        "bias_correction": True,
+        "bias_correction": enable_bias_correction,
         "convert_command": command,
         "eval_limit": limit,
         "quality_gate": {
@@ -108,6 +114,7 @@ def main() -> None:
     parser.add_argument("--out_dir", required=True, type=Path, help="Output directory for checkpoint + manifest")
     parser.add_argument("--limit", type=int, default=None, help="Eval video limit recorded in manifest")
     parser.add_argument("--dry_run", action="store_true", help="Only write manifest; do not run conversion")
+    parser.add_argument("--enable_bias_correction", action="store_true", help="Opt into experimental mean-based bias correction; disabled by default after PR3 smoke showed PSNR regression")
     args = parser.parse_args()
 
     manifest = build_lsgquant_eval_manifest(
@@ -117,6 +124,7 @@ def main() -> None:
         mode=args.mode,
         out_dir=args.out_dir,
         limit=args.limit,
+        enable_bias_correction=args.enable_bias_correction,
     )
     args.out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = args.out_dir / "lsgquant_eval_manifest.json"

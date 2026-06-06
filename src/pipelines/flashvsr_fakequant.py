@@ -10,6 +10,7 @@ Supports modes:
   - a8w8:  int8 activation quant,     int8 weights
   - a16w4: no activation quant,      packed-int4 weights
   - a8w4:  int8 activation quant,     packed-int4 weights
+  - a4w4:  int4 activation QDQ,        packed-int4 weights
 
 All computation inside FakeQuantLinear is performed in float32 after dequantizing
 integer tensors back to float, then the output dtype is restored to match the input.

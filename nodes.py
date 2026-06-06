@@ -849,7 +849,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
     # FIX: quantize_mode parameter should drive FakeQuant pipeline selection
     # not just be informational. Map quantize_mode → fq_mode for FakeQuant paths.
     fq_mode = None
-    fakequant_modes = ("FakeQuant_A8W8", "FakeQuant_A8W8_DRAQ", "FakeQuant_A8W4", "FakeQuant_A16W8", "FakeQuant_A16W4")
+    fakequant_modes = ("FakeQuant_A8W8", "FakeQuant_A8W8_DRAQ", "FakeQuant_A8W4", "FakeQuant_A16W8", "FakeQuant_A16W4", "FakeQuant_A4W4")
     if quantize_mode in fakequant_modes:
         mode_map = {
             "FakeQuant_A8W8": "a8w8",
@@ -857,6 +857,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
             "FakeQuant_A8W4": "a8w4",
             "FakeQuant_A16W8": "a16w8",
             "FakeQuant_A16W4": "a16w4",
+            "FakeQuant_A4W4": "a4w4",
         }
         fq_mode = mode_map[quantize_mode]
         is_fakequant_ckpt = True
@@ -883,6 +884,8 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
             detected_fq_mode = "a8w8"
             if "a16w8" in ckpt_path.lower():
                 detected_fq_mode = "a16w8"
+            elif "a4w4" in ckpt_path.lower():
+                detected_fq_mode = "a4w4"
             elif "a8w4" in ckpt_path.lower():
                 detected_fq_mode = "a8w4"
             elif "a16w4" in ckpt_path.lower():

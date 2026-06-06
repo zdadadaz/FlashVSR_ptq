@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-VALID_LAYER_MODES = {"a16w8", "a8w8", "a16w4", "a8w4", "fp16_skip"}
+VALID_LAYER_MODES = {"a16w8", "a8w8", "a16w4", "a8w4", "a4w4", "fp16_skip"}
 VALID_ACTIVATION_QDQ_MODES = {
     "static_asymmetric",
     "dynamic_symmetric",
@@ -121,7 +121,7 @@ def build_lsgquant_volts_policy(
         counts[tier] += 1
         layers[name] = {
             "mode": default_mode,
-            "activation_qdq_mode": default_activation_qdq_mode if default_mode.startswith("a8") else None,
+            "activation_qdq_mode": default_activation_qdq_mode if default_mode.startswith(("a8", "a4")) else None,
             "tier": tier,
             "mu_var": mu_var,
         }
@@ -178,7 +178,7 @@ def build_august_mixed_policy(
         else:
             decision = LayerDecision(
                 mode=robust_mode,
-                activation_qdq_mode=robust_activation_qdq_mode if robust_mode.startswith("a8") else None,
+                activation_qdq_mode=robust_activation_qdq_mode if robust_mode.startswith(("a8", "a4")) else None,
                 reason=f"{group} is assigned to INT8 activation path",
             )
         layer_entry = {"mode": decision.mode, "reason": decision.reason, "group": group}

@@ -94,6 +94,15 @@ def build_lsgquant_eval_manifest(
         "mode": mode,
         "activation_qdq_mode": "draq_symmetric",
         "bias_correction": enable_bias_correction,
+        "experimental_options": {
+            "bias_correction": {
+                "enabled": enable_bias_correction,
+                "opt_in_flag": "--enable_bias_correction",
+                "status": "experimental_opt_in",
+                "default": False,
+                "rationale": "Disabled by default after PR3 smoke ablation showed PSNR regression.",
+            }
+        },
         "convert_command": command,
         "eval_limit": limit,
         "quality_gate": {

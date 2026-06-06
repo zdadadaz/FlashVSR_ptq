@@ -64,7 +64,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True, type=Path, help="FP16 DiT checkpoint")
     parser.add_argument("--calibration_cache", default=Path(""), type=Path, help="Calibration cache JSON")
     parser.add_argument("--policy", default=Path(""), type=Path, help="LSGQuant/VOLTS policy JSON")
-    parser.add_argument("--mode", default="a8w8", choices=["a8w8", "a16w8", "a8w4", "a16w4"], help="Quantization mode")
+    parser.add_argument("--mode", default="a8w8", choices=["a8w8", "a16w8", "a8w4", "a16w4", "a4w4"], help="Quantization mode")
     parser.add_argument("--rank", type=int, default=32, help="QAO low-rank branch rank")
     parser.add_argument("--qao_rounds", type=int, default=4, help="QAO residual/SVD refinement rounds")
     parser.add_argument("--rotation", default="identity", choices=["identity", "hadamard"], help="Optional QAO/input rotation path")

@@ -271,6 +271,7 @@ def _mode_to_activation_and_weight_bits(mode: str) -> tuple[str, int]:
         "a16w8": ("a16", 8),
         "a8w4": ("a8", 4),
         "a16w4": ("a16", 4),
+        "a4w4": ("a4", 4),
     }
     try:
         return mapping[mode]
@@ -314,10 +315,11 @@ def convert_model_to_lsgquant_qao(
                 activation_mode, weight_bits = _mode_to_activation_and_weight_bits(layer_mode)
                 stats = (act_stats or {}).get(full_name, {})
                 start = time.perf_counter()
+                layer_rank = int(policy.get("rank", rank))
                 replacement, result = qao_linear_from_float(
                     child,
                     weight_bits=weight_bits,
-                    rank=rank,
+                    rank=layer_rank,
                     rounds=rounds,
                     rotation=rotation,
                     activation_mode=activation_mode,
@@ -332,6 +334,8 @@ def convert_model_to_lsgquant_qao(
                     {
                         "name": full_name,
                         "rank": int(result.rank),
+                        "mode": layer_mode,
+                        "activation_qdq_mode": policy.get("activation_qdq_mode", activation_qdq_mode),
                         "weight_bits": int(result.weight_bits),
                         "error_before": float(result.error_before),
                         "error_after": float(result.error_after),

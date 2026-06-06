@@ -11,6 +11,7 @@ from .fakequant import (
     collect_activation_stats_fakequant,
     get_all_linear_layers,
 )
+from .lsgquant import LSGQuantLinear
 
 from .ptq import (
     SymmetricWeightLinear,
@@ -25,8 +26,9 @@ from .smoothquant import (
 )
 
 __all__ = [
-    # FakeQuant (true integer)
+    # FakeQuant / LSGQuant (true integer residual)
     "FakeQuantLinear",
+    "LSGQuantLinear",
     "convert_model_to_fakequant",
     "collect_activation_stats_fakequant",
     "get_all_linear_layers",

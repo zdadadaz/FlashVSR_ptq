@@ -12,7 +12,17 @@ from .fakequant import (
     get_all_linear_layers,
 )
 from .lsgquant import LSGQuantLinear
-from .qao import QAOResult, convert_model_to_lsgquant_qao, dequantize_weight, qao_decompose_weight, qao_linear_from_float, quantize_weight_symmetric
+from .qao import (
+    QAOResult,
+    apply_hadamard_rotation,
+    convert_model_to_lsgquant_qao,
+    dequantize_weight,
+    normalized_hadamard_matrix,
+    qao_decompose_weight,
+    qao_linear_from_float,
+    quantize_weight_symmetric,
+    rotate_linear_weight,
+)
 
 from .ptq import (
     SymmetricWeightLinear,
@@ -31,10 +41,13 @@ __all__ = [
     "FakeQuantLinear",
     "LSGQuantLinear",
     "QAOResult",
+    "apply_hadamard_rotation",
     "convert_model_to_lsgquant_qao",
+    "normalized_hadamard_matrix",
     "qao_decompose_weight",
     "qao_linear_from_float",
     "quantize_weight_symmetric",
+    "rotate_linear_weight",
     "dequantize_weight",
     "convert_model_to_fakequant",
     "collect_activation_stats_fakequant",

@@ -37,6 +37,7 @@ class LSGQuantLinear(nn.Module):
         act_quant_enabled: bool = True,
         activation_qdq_mode: str = "static_asymmetric",
         draq_qrange: str = "signed_symmetric",
+        rotation: str = "identity",
         bias: bool = True,
         device=None,
         dtype=None,
@@ -44,11 +45,18 @@ class LSGQuantLinear(nn.Module):
         super().__init__()
         if rank < 0:
             raise ValueError(f"rank must be >= 0, got {rank}")
+        rotation_to_id = {"identity": 0, "hadamard": 1}
+        if rotation not in rotation_to_id:
+            raise ValueError(f"Unsupported rotation: {rotation}")
 
         self.in_features = in_features
         self.out_features = out_features
         self.rank = int(rank)
         low_rank_dtype = dtype or torch.float32
+        self.register_buffer(
+            "rotation_mode_code",
+            torch.tensor(rotation_to_id[rotation], dtype=torch.int32, device=device),
+        )
 
         self.residual = FakeQuantLinear(
             in_features,
@@ -84,6 +92,7 @@ class LSGQuantLinear(nn.Module):
         act_quant_enabled: bool = True,
         activation_qdq_mode: str = "static_asymmetric",
         draq_qrange: str = "signed_symmetric",
+        rotation: str = "identity",
         ch_axis: int = -1,
         low_rank_l1: torch.Tensor = None,
         low_rank_l2: torch.Tensor = None,
@@ -118,6 +127,7 @@ class LSGQuantLinear(nn.Module):
             act_quant_enabled=act_quant_enabled,
             activation_qdq_mode=activation_qdq_mode,
             draq_qrange=draq_qrange,
+            rotation=rotation,
             bias=linear_module.bias is not None,
             device=linear_module.weight.device,
             dtype=linear_module.weight.dtype,
@@ -155,9 +165,13 @@ class LSGQuantLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
-        y = self.residual(x).to(torch.float32)
+        x_branch = x
+        if int(self.rotation_mode_code.item()) == 1:
+            from .qao import apply_hadamard_rotation
+            x_branch = apply_hadamard_rotation(x)
+        y = self.residual(x_branch).to(torch.float32)
         if self.rank > 0:
-            x_fp = x.to(torch.float32)
+            x_fp = x_branch.to(torch.float32)
             l2 = self.l2_weight.to(device=x.device, dtype=torch.float32)
             l1 = self.l1_weight.to(device=x.device, dtype=torch.float32)
             y = y + F.linear(F.linear(x_fp, l2), l1)

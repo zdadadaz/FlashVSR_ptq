@@ -64,11 +64,11 @@ def test_qao_decompose_weight_supports_w4_and_roundtrip_shapes():
     assert torch.isfinite(reconstructed).all()
 
 
-def test_qao_rejects_unsupported_rotation_until_pr7():
+def test_qao_rejects_unknown_rotation():
     try:
-        qao_decompose_weight(_structured_weight(), weight_bits=8, rank=2, rotation="hadamard")
+        qao_decompose_weight(_structured_weight(), weight_bits=8, rank=2, rotation="fft")
     except ValueError as exc:
-        assert "identity" in str(exc)
+        assert "identity" in str(exc) and "hadamard" in str(exc)
     else:
         raise AssertionError("expected ValueError for unsupported rotation")
 

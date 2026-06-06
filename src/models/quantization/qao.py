@@ -16,6 +16,61 @@ import torch.nn as nn
 from .lsgquant import LSGQuantLinear
 
 
+def _next_power_of_two(n: int) -> int:
+    if n <= 0:
+        raise ValueError(f"feature dimension must be positive, got {n}")
+    return 1 << (n - 1).bit_length()
+
+
+def normalized_hadamard_matrix(size: int, device=None, dtype=torch.float32) -> torch.Tensor:
+    """Return an orthonormal Hadamard matrix for power-of-two ``size``."""
+
+    if size <= 0 or size & (size - 1):
+        raise ValueError(f"Hadamard size must be a positive power of two, got {size}")
+    h = torch.ones(1, 1, device=device, dtype=torch.float32)
+    while h.shape[0] < size:
+        h = torch.cat(
+            [torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)],
+            dim=0,
+        )
+    h = h / (float(size) ** 0.5)
+    return h.to(dtype=dtype)
+
+
+def apply_hadamard_rotation(x: torch.Tensor) -> torch.Tensor:
+    """Apply normalized Hadamard rotation on the last dimension.
+
+    Non-power-of-two feature dimensions are zero-padded to the next power of two,
+    rotated, then cropped back. This keeps tensor shapes stable for debug/runtime
+    correctness even though exact orthonormality only holds in the padded space.
+    """
+
+    features = x.shape[-1]
+    padded_features = _next_power_of_two(features)
+    x_float = x.to(torch.float32)
+    if padded_features != features:
+        x_float = torch.nn.functional.pad(x_float, (0, padded_features - features))
+    h = normalized_hadamard_matrix(padded_features, device=x.device, dtype=torch.float32)
+    rotated = torch.matmul(x_float, h.t())
+    return rotated[..., :features].to(dtype=x.dtype)
+
+
+def rotate_linear_weight(weight: torch.Tensor, rotation: str = "identity") -> torch.Tensor:
+    """Rotate a Linear weight matrix on its input-feature dimension."""
+
+    if rotation == "identity":
+        return weight.detach().to(torch.float32)
+    if rotation != "hadamard":
+        raise ValueError("rotation must be 'identity' or 'hadamard'")
+    out_features, in_features = weight.shape
+    padded_features = _next_power_of_two(in_features)
+    w = weight.detach().to(torch.float32)
+    if padded_features != in_features:
+        w = torch.nn.functional.pad(w, (0, padded_features - in_features))
+    h = normalized_hadamard_matrix(padded_features, device=w.device, dtype=torch.float32)
+    return (w @ h)[..., :in_features].contiguous()
+
+
 @dataclass(frozen=True)
 class QAOResult:
     """Result of decomposing ``weight`` into quantized residual + low-rank FP."""
@@ -106,8 +161,8 @@ def qao_decompose_weight(
     candidate across iterations is returned.
     """
 
-    if rotation != "identity":
-        raise ValueError("Only rotation='identity' is implemented in PR6; Hadamard belongs to PR7")
+    if rotation not in ("identity", "hadamard"):
+        raise ValueError("rotation must be 'identity' or 'hadamard'")
     if rank < 0:
         raise ValueError(f"rank must be >= 0, got {rank}")
     if rounds < 0:
@@ -115,7 +170,7 @@ def qao_decompose_weight(
     if weight.dim() != 2:
         raise ValueError(f"Expected 2D Linear weight [out, in], got shape {tuple(weight.shape)}")
 
-    w = weight.detach().to(device="cpu", dtype=torch.float32)
+    w = rotate_linear_weight(weight.detach(), rotation=rotation).to(device="cpu", dtype=torch.float32)
     pure_int, pure_scale = quantize_weight_symmetric(w, bits=weight_bits)
     pure_error = torch.linalg.vector_norm(w - dequantize_weight(pure_int, pure_scale)).item()
 
@@ -202,6 +257,7 @@ def qao_linear_from_float(
         act_quant_enabled=act_quant_enabled,
         activation_qdq_mode=activation_qdq_mode,
         draq_qrange=draq_qrange,
+        rotation=rotation,
         low_rank_l1=result.l1.to(device=linear_module.weight.device, dtype=linear_module.weight.dtype),
         low_rank_l2=result.l2.to(device=linear_module.weight.device, dtype=linear_module.weight.dtype),
     )

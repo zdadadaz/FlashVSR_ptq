@@ -279,6 +279,102 @@ def _mode_to_activation_and_weight_bits(mode: str) -> tuple[str, int]:
         raise ValueError(f"Unsupported mode={mode}; expected one of {sorted(mapping)}") from exc
 
 
+def infer_lsgquant_layer_policy_from_state_dict(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    default_activation_qdq_mode: str = "draq_symmetric",
+) -> dict[str, dict]:
+    """Infer per-layer LSGQuant module config from a QAO checkpoint state_dict."""
+
+    activation_id_to_mode = {1: "a16", 2: "a8", 3: "a4"}
+    policy: dict[str, dict] = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        residual_weight_key = f"{name}.residual.weight_int"
+        if residual_weight_key not in state_dict:
+            continue
+        weight_int = state_dict[residual_weight_key]
+        if weight_int.dim() != 2:
+            continue
+        packed_cols = (module.in_features + 1) // 2
+        if weight_int.shape[1] == packed_cols:
+            weight_mode = "w4"
+        elif weight_int.shape[1] == module.in_features:
+            weight_mode = "w8"
+        else:
+            raise ValueError(
+                f"Cannot infer LSGQuant weight mode for {name}: weight_int shape={tuple(weight_int.shape)}, "
+                f"in_features={module.in_features}"
+            )
+        activation_mode = "a8"
+        activation_key = f"{name}.residual.activation_mode_code"
+        if activation_key in state_dict:
+            activation_mode = activation_id_to_mode.get(int(state_dict[activation_key].item()), activation_mode)
+        rank = 0
+        l2_key = f"{name}.l2_weight"
+        if l2_key in state_dict and state_dict[l2_key].dim() == 2:
+            rank = int(state_dict[l2_key].shape[0])
+        rotation = "identity"
+        rotation_key = f"{name}.rotation_mode_code"
+        if rotation_key in state_dict and int(state_dict[rotation_key].item()) == 1:
+            rotation = "hadamard"
+        entry = {
+            "mode": f"{activation_mode}{weight_mode}",
+            "rank": rank,
+            "activation_qdq_mode": default_activation_qdq_mode,
+            "rotation": rotation,
+        }
+        policy[name] = entry
+    return policy
+
+
+def convert_model_to_lsgquant_shell(
+    model: nn.Module,
+    layer_policy: dict[str, dict],
+    activation_qdq_mode: str = "draq_symmetric",
+    draq_qrange: str = "signed_symmetric",
+) -> nn.Module:
+    """Replace ``nn.Linear`` layers with empty LSGQuant shells before loading a QAO state_dict."""
+
+    def convert_children(parent: nn.Module, prefix: str = "") -> None:
+        for child_name, child in list(parent.named_children()):
+            full_name = f"{prefix}.{child_name}" if prefix else child_name
+            if isinstance(child, nn.Linear) and full_name in layer_policy:
+                policy = layer_policy[full_name]
+                layer_mode = policy.get("mode", "a8w8")
+                if layer_mode == "fp16_skip":
+                    continue
+                activation_mode, weight_bits = _mode_to_activation_and_weight_bits(layer_mode)
+                replacement = LSGQuantLinear(
+                    child.in_features,
+                    child.out_features,
+                    rank=int(policy.get("rank", 0)),
+                    activation_mode=activation_mode,
+                    weight_mode={8: "w8", 4: "w4"}[weight_bits],
+                    act_quant_enabled=bool(policy.get("act_quant_enabled", True)),
+                    activation_qdq_mode=policy.get("activation_qdq_mode", activation_qdq_mode),
+                    draq_qrange=policy.get("draq_qrange", draq_qrange),
+                    rotation=policy.get("rotation", "identity"),
+                    bias=child.bias is not None,
+                    device=child.weight.device,
+                    dtype=child.weight.dtype,
+                )
+                setattr(parent, child_name, replacement)
+            else:
+                convert_children(child, full_name)
+
+    convert_children(model)
+    model._lsgquant_shell_conversion_summary = {
+        "layers": len(layer_policy),
+        "mode_counts": {},
+    }
+    for entry in layer_policy.values():
+        mode = entry.get("mode", "unknown")
+        model._lsgquant_shell_conversion_summary["mode_counts"][mode] = model._lsgquant_shell_conversion_summary["mode_counts"].get(mode, 0) + 1
+    return model
+
+
 def convert_model_to_lsgquant_qao(
     model: nn.Module,
     mode: str = "a8w8",

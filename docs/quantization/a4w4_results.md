@@ -72,8 +72,67 @@ Covered behavior:
 - QAO conversion uses per-layer rank and allows high-sensitivity `a8w8` fallback inside
   an `a4w4` default policy.
 
-## Quality status
+## Completed PR-9 full-video smoke eval (2026-06-06)
 
-No paper-comparable A4W4 video-quality numbers are claimed in this PR. The manifest
-contains `quality_delta.status = pending_eval` until full FlashVSR renders complete
-without NaN/Inf and PSNR/SSIM/LPIPS/temporal metrics are filled.
+A real A4W4 rank-32 QAO checkpoint was materialized and rendered end-to-end.
+
+Artifacts:
+
+- Eval manifest: `outputs/lsgquant/pr9_a4w4_rank32_full_eval/lsgquant_eval_manifest.json`
+- QAO checkpoint: `outputs/lsgquant/pr9_a4w4_rank32_full_eval/dit_lsgquant_a4w4_rank32_qao.safetensors`
+- QAO manifest: `outputs/lsgquant/pr9_a4w4_rank32_full_eval/dit_lsgquant_a4w4_rank32_qao.safetensors.manifest.json`
+- FP16 render: `outputs/lsgquant/pr9_a4w4_rank32_full_eval/video_render_animal2_full/animal_2_fp16_full.mp4`
+- A4W4 render: `outputs/lsgquant/pr9_a4w4_rank32_full_eval/video_render_animal2_full/animal_2_a4w4_rank32_qao_full.mp4`
+- PSNR JSON: `outputs/lsgquant/pr9_a4w4_rank32_full_eval/video_render_animal2_full/animal_2_fp16_vs_a4w4_rank32_qao_psnr.json`
+
+Conversion summary:
+
+- QAO layers: 306
+- Improved layers: 306
+- Mean Frobenius error: 0.744896 → 0.587730
+- Mode counts: {'a8w8': 297, 'a4w4': 9}
+- Rank counts: {'32': 299, '16': 7}
+
+Full-video render smoke:
+
+- Input: `data/lowres/animal_2.mp4` from the main FlashVSR worktree
+- Frames: 150 / 150
+- Settings: scale=4, mode=tiny, bf16, SDPA, resize_factor=0.25, frame_chunk_size=10, no color fix
+- Candidate integrity: decoded successfully as uint8 video; no NaN/Inf-corruption signal.
+- PSNR vs same-settings FP16 baseline: avg 27.1545 dB, min 26.3113 dB, max 34.4271 dB.
+
+Status: PR-9 success criteria are now completed for an end-to-end full-video smoke run.
+This is still not a paper-comparable UDM10/REDS30/MVSR4x benchmark.
+
+## PR-9 paper-comparable benchmark slice (2026-06-06)
+
+Added `scripts/ptq/run_lsgquant_pr9_paper_benchmark.py` to run the LSGQuant paper dataset contract: UDM10 / REDS30 / MVSR4x, FP16 baseline vs A4W4 rank-32 QAO, with GT PSNR and PTQ-minus-FP16 deltas.  Wan VAE / decoder remain unquantized.
+
+Artifacts:
+
+- Manifest: `outputs/lsgquant/pr9_paper_benchmark_firstclip16/lsgquant_pr9_paper_benchmark_manifest.json`
+- Benchmark runner: `scripts/ptq/run_lsgquant_pr9_paper_benchmark.py`
+- Unit tests: `tests/scripts/ptq/test_lsgquant_pr9_paper_benchmark.py`
+- A4W4 QAO checkpoint: `outputs/lsgquant/pr9_a4w4_rank32_full_eval/dit_lsgquant_a4w4_rank32_qao.safetensors`
+
+Executed benchmark slice:
+
+- Frames per clip: 16
+- Clips: 3 total, `limit_per_dataset=1`
+- Metrics: PSNR vs GT and A4W4-QAO minus FP16 PSNR delta
+
+- MVSR4x:
+  - FP16 vs GT: 19.8820 dB
+  - A4W4-QAO vs GT: 20.2737 dB
+  - Delta: +0.3917 dB
+- REDS30:
+  - FP16 vs GT: 20.4988 dB
+  - A4W4-QAO vs GT: 20.2002 dB
+  - Delta: -0.2986 dB
+- UDM10:
+  - FP16 vs GT: 24.3386 dB
+  - A4W4-QAO vs GT: 23.9180 dB
+  - Delta: -0.4206 dB
+- Overall delta: -0.1092 dB
+
+Status: paper-comparable harness and first-clip-per-dataset PSNR slice are complete. Full official paper table still requires running the same harness without `--limit_per_dataset` and wiring optional IQA/VQA metrics beyond PSNR.

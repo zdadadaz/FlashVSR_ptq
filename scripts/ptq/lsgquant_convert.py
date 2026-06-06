@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 
 def build_lsgquant_qao_manifest(

@@ -867,10 +867,10 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
         log(f"FakeQuant checkpoint detected: {ckpt_path}", message_type='info', icon="🔍")
         try:
             from .src.models.wan_video_dit import WanModel
-            from .src.models.quantization.fakequant import convert_model_to_fakequant, convert_ops_to_fakequant
+            from .src.models.quantization.fakequant import convert_model_to_fakequant, convert_ops_to_fakequant, infer_fakequant_layer_policy_from_state_dict
         except ImportError:
             from src.models.wan_video_dit import WanModel
-            from src.models.quantization.fakequant import convert_model_to_fakequant, convert_ops_to_fakequant
+            from src.models.quantization.fakequant import convert_model_to_fakequant, convert_ops_to_fakequant, infer_fakequant_layer_policy_from_state_dict
 
         # FlashVSR-v1.1 config
         dit = WanModel(
@@ -892,9 +892,9 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
                 detected_fq_mode = "a16w4"
         fq_mode = detected_fq_mode
         log(f"FakeQuant mode: {fq_mode}", message_type='info', icon="🔍")
-        convert_model_to_fakequant(dit, mode=fq_mode, act_stats=None)
 
-        # Load state dict
+        # Load state dict before FakeQuant module construction so mixed W4/W8
+        # checkpoints can infer per-layer modes from tensor shapes.
         if ckpt_path.endswith(".safetensors"):
             from safetensors.torch import load_file
             sd_dit = load_file(ckpt_path)
@@ -907,6 +907,14 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
                 new_sd[k[6:]] = v
             else:
                 new_sd[k] = v
+        inferred_policy = infer_fakequant_layer_policy_from_state_dict(
+            dit, new_sd, default_activation_qdq_mode="draq_symmetric"
+        )
+        if inferred_policy:
+            log(f"Inferred FakeQuant per-layer policy from checkpoint: {len(inferred_policy)} layers", message_type='info', icon="🧩")
+            convert_model_to_fakequant(dit, mode=fq_mode, act_stats=None, layer_policy=inferred_policy, activation_qdq_mode="draq_symmetric")
+        else:
+            convert_model_to_fakequant(dit, mode=fq_mode, act_stats=None)
         dit.load_state_dict(new_sd, strict=False)
         dit.eval()
 

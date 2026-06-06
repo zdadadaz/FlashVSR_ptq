@@ -6,7 +6,11 @@ import torch
 import torch.nn as nn
 
 from scripts.ptq.generate_layer_policy import build_policy_from_layer_names
-from src.models.quantization.fakequant import FakeQuantLinear, convert_model_to_fakequant
+from src.models.quantization.fakequant import (
+    FakeQuantLinear,
+    convert_model_to_fakequant,
+    infer_fakequant_layer_policy_from_state_dict,
+)
 from src.models.quantization.policy import load_layer_policy
 
 
@@ -86,6 +90,35 @@ def test_policy_and_generator_allow_a4w4(tmp_path):
 
     assert loaded["default"] == {"mode": "a4w4", "activation_qdq_mode": "dynamic_symmetric"}
     assert loaded["layers"]["blocks.0.ffn.0"]["mode"] == "a4w4"
+
+
+def test_infer_policy_from_mixed_a4w4_a16w8_state_dict_shapes():
+    model = nn.Sequential(nn.Linear(4, 3), nn.Linear(4, 2))
+    mixed = nn.Sequential(nn.Linear(4, 3), nn.Linear(4, 2))
+    mixed = convert_model_to_fakequant(
+        mixed,
+        mode="a4w4",
+        act_stats=None,
+        activation_qdq_mode="draq_symmetric",
+        layer_policy={"1": {"mode": "a16w8"}},
+    )
+    state_dict = mixed.state_dict()
+
+    policy = infer_fakequant_layer_policy_from_state_dict(model, state_dict, default_activation_qdq_mode="draq_symmetric")
+
+    assert policy["0"] == {"mode": "a4w4", "activation_qdq_mode": "draq_symmetric"}
+    assert policy["1"] == {"mode": "a16w8"}
+    converted = convert_model_to_fakequant(
+        model,
+        mode="a4w4",
+        act_stats=None,
+        activation_qdq_mode="draq_symmetric",
+        layer_policy=policy,
+    )
+    converted.load_state_dict(state_dict, strict=False)
+    assert converted[0].weight_int.shape == state_dict["0.weight_int"].shape
+    assert converted[1].weight_int.shape == state_dict["1.weight_int"].shape
+
 
 
 def test_fakequant_convert_and_cli_expose_a4w4():

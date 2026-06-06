@@ -1,5 +1,5 @@
 """
-Convert FlashVSR DiT checkpoint → FakeQuant PTQ format (a8w8 / a16w8 / a8w4 / a16w4).
+Convert FlashVSR DiT checkpoint → FakeQuant PTQ format (a8w8 / a16w8 / a8w4 / a16w4 / a4w4).
 
 Steps:
   1. Load full-precision WanModel from checkpoint.
@@ -140,7 +140,7 @@ def main():
                        help="Output path for quantized checkpoint")
     parser.add_argument(
         "--mode", type=str, default="a8w8",
-        choices=["a16w8", "a8w8", "a16w4", "a8w4"],
+        choices=["a16w8", "a8w8", "a16w4", "a8w4", "a4w4"],
         help="Quantization mode"
     )
     parser.add_argument(
@@ -157,7 +157,7 @@ def main():
         "--activation_qdq_mode", type=str, default="static_asymmetric",
         choices=["static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric", "draq_symmetric"],
         help=(
-            "A8 activation QDQ policy. static_asymmetric uses calibrated per-channel "
+            "Activation QDQ policy. A8 static_asymmetric uses calibrated per-channel "
             "scale/zero_point from --calibration_cache. dynamic_symmetric and "
             "dynamic_asymmetric compute per-token activation scales at runtime; "
             "draq_symmetric uses LSGQuant online channel+token scaling."

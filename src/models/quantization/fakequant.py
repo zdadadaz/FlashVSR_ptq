@@ -508,6 +508,54 @@ class FakeQuantConv3d(_FakeQuantConvNd):
 # Model conversion
 # ------------------------------------------------------------------
 
+def infer_fakequant_layer_policy_from_state_dict(
+    model,
+    state_dict: dict[str, torch.Tensor],
+    default_activation_qdq_mode: str = "draq_symmetric",
+) -> dict[str, dict[str, str]]:
+    """Infer per-Linear FakeQuant modes from a converted checkpoint state_dict.
+
+    This lets runtime instantiate mixed W4/W8 checkpoints before loading weights.
+    A single global FakeQuant mode is insufficient for policies such as
+    default `a4w4` with sensitive `a16w8`, because packed-W4 and W8
+    `weight_int` tensors have different shapes.
+    """
+
+    activation_id_to_mode = {1: "a16", 2: "a8", 3: "a4"}
+    policy: dict[str, dict[str, str]] = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        weight_key = f"{name}.weight_int"
+        activation_key = f"{name}.activation_mode_code"
+        if weight_key not in state_dict:
+            continue
+        weight_int = state_dict[weight_key]
+        if weight_int.dim() != 2:
+            continue
+        packed_cols = (module.in_features + 1) // 2
+        if weight_int.shape[1] == packed_cols:
+            weight_mode = "w4"
+        elif weight_int.shape[1] == module.in_features:
+            weight_mode = "w8"
+        else:
+            raise ValueError(
+                f"Cannot infer weight mode for {name}: weight_int shape={tuple(weight_int.shape)}, "
+                f"in_features={module.in_features}"
+            )
+
+        activation_mode = "a8"
+        if activation_key in state_dict:
+            activation_code = int(state_dict[activation_key].item())
+            activation_mode = activation_id_to_mode.get(activation_code, activation_mode)
+        mode = f"{activation_mode}{weight_mode}"
+        entry: dict[str, str] = {"mode": mode}
+        if activation_mode in ("a8", "a4"):
+            entry["activation_qdq_mode"] = default_activation_qdq_mode
+        policy[name] = entry
+    return policy
+
+
 def convert_model_to_fakequant(
     model,
     mode: str = "a16w8",

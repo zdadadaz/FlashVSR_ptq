@@ -103,6 +103,10 @@ class LSGQuantLinear(nn.Module):
             inferred_rank = int(low_rank_l2.shape[0])
             if int(low_rank_l1.shape[1]) != inferred_rank:
                 raise ValueError("low_rank_l1/low_rank_l2 rank dimensions do not match")
+            if rank not in (0, inferred_rank):
+                raise ValueError(
+                    f"explicit rank {rank} does not match low-rank tensor rank {inferred_rank}"
+                )
             rank = inferred_rank
 
         module = cls(

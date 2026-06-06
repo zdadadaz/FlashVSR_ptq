@@ -67,5 +67,18 @@ def test_lsgquant_state_dict_roundtrip_preserves_residual_and_low_rank_buffers()
     assert clone.state_dict()["l2_weight"].shape == (2, 4)
 
 
+def test_lsgquant_from_float_rejects_explicit_rank_mismatching_low_rank_tensors():
+    linear = _seeded_linear(in_features=4, out_features=3, bias=True)
+    l1 = torch.zeros(3, 2)
+    l2 = torch.zeros(2, 4)
+
+    try:
+        LSGQuantLinear.from_float(linear, rank=3, low_rank_l1=l1, low_rank_l2=l2)
+    except ValueError as exc:
+        assert "rank" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for mismatched explicit rank")
+
+
 def test_lsgquant_linear_is_exported_from_quantization_package():
     assert ExportedLSGQuantLinear is LSGQuantLinear

@@ -203,6 +203,7 @@ class TestFlashVSRNodes(unittest.TestCase):
                 width=64,
                 unload_dit=True,
                 force_offload=True,
+                cfg_scale=1.0,
                 enable_debug_logging=True
             )
         except Exception as e:

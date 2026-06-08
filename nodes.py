@@ -868,9 +868,11 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
         try:
             from .src.models.wan_video_dit import WanModel
             from .src.models.quantization.fakequant import convert_model_to_fakequant, convert_ops_to_fakequant, infer_fakequant_layer_policy_from_state_dict
+            from .src.models.quantization.qao import convert_model_to_lsgquant_shell, infer_lsgquant_layer_policy_from_state_dict
         except ImportError:
             from src.models.wan_video_dit import WanModel
             from src.models.quantization.fakequant import convert_model_to_fakequant, convert_ops_to_fakequant, infer_fakequant_layer_policy_from_state_dict
+            from src.models.quantization.qao import convert_model_to_lsgquant_shell, infer_lsgquant_layer_policy_from_state_dict
 
         # FlashVSR-v1.1 config
         dit = WanModel(
@@ -907,14 +909,29 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
                 new_sd[k[6:]] = v
             else:
                 new_sd[k] = v
-        inferred_policy = infer_fakequant_layer_policy_from_state_dict(
-            dit, new_sd, default_activation_qdq_mode="draq_symmetric"
-        )
-        if inferred_policy:
-            log(f"Inferred FakeQuant per-layer policy from checkpoint: {len(inferred_policy)} layers", message_type='info', icon="🧩")
-            convert_model_to_fakequant(dit, mode=fq_mode, act_stats=None, layer_policy=inferred_policy, activation_qdq_mode="draq_symmetric")
+        is_lsgquant_qao_ckpt = any(k.endswith(".residual.weight_int") for k in new_sd)
+        if is_lsgquant_qao_ckpt:
+            inferred_policy = infer_lsgquant_layer_policy_from_state_dict(
+                dit, new_sd, default_activation_qdq_mode="draq_symmetric"
+            )
+            if not inferred_policy:
+                raise RuntimeError("LSGQuant QAO checkpoint detected but no Linear layer policy could be inferred")
+            log(f"Inferred LSGQuant QAO per-layer policy from checkpoint: {len(inferred_policy)} layers", message_type='info', icon="🧩")
+            convert_model_to_lsgquant_shell(
+                dit,
+                inferred_policy,
+                activation_qdq_mode="draq_symmetric",
+                draq_qrange="signed_symmetric",
+            )
         else:
-            convert_model_to_fakequant(dit, mode=fq_mode, act_stats=None)
+            inferred_policy = infer_fakequant_layer_policy_from_state_dict(
+                dit, new_sd, default_activation_qdq_mode="draq_symmetric"
+            )
+            if inferred_policy:
+                log(f"Inferred FakeQuant per-layer policy from checkpoint: {len(inferred_policy)} layers", message_type='info', icon="🧩")
+                convert_model_to_fakequant(dit, mode=fq_mode, act_stats=None, layer_policy=inferred_policy, activation_qdq_mode="draq_symmetric")
+            else:
+                convert_model_to_fakequant(dit, mode=fq_mode, act_stats=None)
         dit.load_state_dict(new_sd, strict=False)
         dit.eval()
 

@@ -145,6 +145,106 @@ def build_lsgquant_volts_policy(
     }
 
 
+def build_lsgquant_a4w4_fallback_policy(
+    calibration_cache: dict[str, Any],
+    delta1: float = 0.001,
+    delta2: float = 0.075,
+    threshold_mode: str = "absolute",
+    fp16_topk: int = 0,
+    default_activation_qdq_mode: str = "draq_symmetric",
+) -> dict[str, Any]:
+    """Build PR9 A4W4 mixed fallback policy from VOLTS ``mu_var`` stats.
+
+    Policy contract follows the PR9 plan:
+    - low sensitivity: A4W4 LSGQuant rank-16
+    - mid sensitivity: A4W4 LSGQuant rank-32 + light adaptation marker
+    - high sensitivity: A8W8 LSGQuant rank-32 fallback
+    - optional catastrophic top-k: FP16 skip fallback
+    """
+
+    if default_activation_qdq_mode not in VALID_ACTIVATION_QDQ_MODES:
+        raise ValueError(f"Unsupported activation_qdq_mode: {default_activation_qdq_mode}")
+    if fp16_topk < 0:
+        raise ValueError(f"fp16_topk must be >= 0, got {fp16_topk}")
+
+    base = build_lsgquant_volts_policy(
+        calibration_cache,
+        delta1=delta1,
+        delta2=delta2,
+        threshold_mode=threshold_mode,
+        default_mode="a4w4",
+        default_activation_qdq_mode=default_activation_qdq_mode,
+    )
+    ranked = sorted(
+        ((name, float(entry["mu_var"])) for name, entry in base["layers"].items()),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    fp16_names = {name for name, _ in ranked[:fp16_topk]}
+
+    layers: dict[str, dict[str, Any]] = {}
+    fallback_counts = {"a4w4_rank16": 0, "a4w4_rank32_light": 0, "a8w8_rank32": 0, "fp16_skip": 0}
+    for name, entry in base["layers"].items():
+        tier = entry["tier"]
+        mu_var = float(entry["mu_var"])
+        if name in fp16_names:
+            layer = {
+                "mode": "fp16_skip",
+                "tier": tier,
+                "mu_var": mu_var,
+                "rank": 0,
+                "reason": "catastrophic top-k sensitivity fallback; keep FP16 Linear",
+            }
+            fallback_counts["fp16_skip"] += 1
+        elif tier == "frozen":
+            layer = {
+                "mode": "a4w4",
+                "activation_qdq_mode": default_activation_qdq_mode,
+                "tier": tier,
+                "mu_var": mu_var,
+                "rank": 16,
+                "adaptation": "none",
+                "reason": "low VOLTS sensitivity: A4W4 LSGQuant rank-16",
+            }
+            fallback_counts["a4w4_rank16"] += 1
+        elif tier == "light":
+            layer = {
+                "mode": "a4w4",
+                "activation_qdq_mode": default_activation_qdq_mode,
+                "tier": tier,
+                "mu_var": mu_var,
+                "rank": 32,
+                "adaptation": "light",
+                "reason": "mid VOLTS sensitivity: A4W4 LSGQuant rank-32 plus light adaptation",
+            }
+            fallback_counts["a4w4_rank32_light"] += 1
+        else:
+            layer = {
+                "mode": "a8w8",
+                "activation_qdq_mode": default_activation_qdq_mode,
+                "tier": tier,
+                "mu_var": mu_var,
+                "rank": 32,
+                "adaptation": "optional_full",
+                "reason": "high VOLTS sensitivity: fallback to A8W8 LSGQuant rank-32 before FP16 skip",
+            }
+            fallback_counts["a8w8_rank32"] += 1
+        layers[name] = layer
+
+    return {
+        "schema_version": "flashvsr.lsgquant.a4w4_policy.v1",
+        "paper": "arXiv:2602.03182v1",
+        "scope": "WanVideoDiT Linear layers only; Wan VAE remains unquantized",
+        "default": {"mode": "a4w4", "activation_qdq_mode": default_activation_qdq_mode, "rank": 16},
+        "thresholds": base["thresholds"],
+        "tiers": base["tiers"],
+        "counts": base["counts"],
+        "fallback_counts": fallback_counts,
+        "fp16_topk": int(fp16_topk),
+        "layers": layers,
+    }
+
+
 def build_august_mixed_policy(
     layer_names: list[str],
     sensitive_mode: str = "a16w8",

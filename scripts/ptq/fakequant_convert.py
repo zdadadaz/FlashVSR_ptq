@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -98,6 +99,33 @@ def load_calibration_cache(cache_path: str, device="cuda"):
     return result
 
 
+def load_lsgquant_layer_policy(path: str | Path):
+    """Load PR-3 LSGQuant policy entries plus a compact summary for manifests."""
+
+    raw = load_layer_policy(path)
+    entries = layer_policy_entries(raw)
+    tier_counts = {}
+    mode_counts = {}
+    for entry in entries.values():
+        tier = entry.get("tier")
+        if tier:
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        mode = entry.get("mode")
+        if mode:
+            mode_counts[mode] = mode_counts.get(mode, 0) + 1
+    summary = {
+        "path": str(path),
+        "schema_version": raw.get("schema_version"),
+        "scope": raw.get("scope"),
+        "default": raw.get("default"),
+        "thresholds": raw.get("thresholds"),
+        "tier_counts": tier_counts,
+        "mode_counts": mode_counts,
+        "layers": len(entries),
+    }
+    return entries, summary
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -145,6 +173,10 @@ def main():
         help="Optional per-layer policy JSON for mixed precision recovery."
     )
     parser.add_argument(
+        "--policy", type=str, default="",
+        help="Alias for --policy_json; intended for LSGQuant/VOLTS PR-3 policy files."
+    )
+    parser.add_argument(
         "--enable_bias_correction", action="store_true",
         help="Apply activation-mean-based deterministic bias correction when act_mean exists in calibration cache."
     )
@@ -172,9 +204,13 @@ def main():
         )
 
     layer_policy = None
-    if args.policy_json:
-        layer_policy = layer_policy_entries(load_layer_policy(args.policy_json))
-        print(f"[Convert] Loaded layer policy for {len(layer_policy)} layers: {args.policy_json}")
+    policy_summary = None
+    policy_path = args.policy or args.policy_json
+    if args.policy and args.policy_json and args.policy != args.policy_json:
+        raise ValueError("Use only one policy path: --policy or --policy_json")
+    if policy_path:
+        layer_policy, policy_summary = load_lsgquant_layer_policy(policy_path)
+        print(f"[Convert] Loaded layer policy for {len(layer_policy)} layers: {policy_path}")
 
     # ------------------------------------------------------------------
     # 3. Convert nn.Linear → FakeQuantLinear
@@ -222,7 +258,8 @@ def main():
         "checkpoint": args.checkpoint,
         "output": args.output,
         "calibration_cache": args.calibration_cache or None,
-        "policy_json": args.policy_json or None,
+        "policy_json": policy_path or None,
+        "policy_summary": policy_summary,
         "draq_qrange": args.draq_qrange,
     })
     summary_path = f"{args.output}.conversion_summary.json"

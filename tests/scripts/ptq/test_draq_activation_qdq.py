@@ -117,3 +117,14 @@ def test_fakequant_convert_cli_exposes_draq_activation_mode():
 
     assert "draq_symmetric" in result.stdout
     assert "--draq_qrange" in result.stdout
+
+
+def test_flashvsr_cli_accepts_draq_fakequant_alias():
+    result = subprocess.run(
+        [sys.executable, "cli_main.py", "--help"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    assert "FakeQuant_A8W8_DRAQ" in result.stdout

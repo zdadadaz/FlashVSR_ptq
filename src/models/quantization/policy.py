@@ -16,6 +16,7 @@ VALID_ACTIVATION_QDQ_MODES = {
     "static_asymmetric",
     "dynamic_symmetric",
     "dynamic_asymmetric",
+    "draq_symmetric",
 }
 
 
@@ -42,6 +43,106 @@ def classify_layer_name(name: str) -> str:
     if ".cross_attn." in name:
         return "cross_attn"
     return "other"
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    """Small dependency-free percentile helper for CLI policy generation."""
+
+    if not values:
+        raise ValueError("Cannot compute percentile of an empty value list")
+    if percentile < 0.0 or percentile > 100.0:
+        raise ValueError(f"percentile must be in [0, 100], got {percentile}")
+    sorted_values = sorted(float(v) for v in values)
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    rank = (len(sorted_values) - 1) * percentile / 100.0
+    low = int(rank)
+    high = min(low + 1, len(sorted_values) - 1)
+    frac = rank - low
+    return sorted_values[low] * (1.0 - frac) + sorted_values[high] * frac
+
+
+def build_lsgquant_volts_policy(
+    calibration_cache: dict[str, Any],
+    delta1: float = 0.001,
+    delta2: float = 0.075,
+    threshold_mode: str = "absolute",
+    default_mode: str = "a8w8",
+    default_activation_qdq_mode: str = "draq_symmetric",
+) -> dict[str, Any]:
+    """Build an LSGQuant/VOLTS-style three-tier policy from calibration mu_var.
+
+    Tiers:
+    - frozen: mu_var <= delta1
+    - light:  delta1 < mu_var <= delta2
+    - full:   mu_var > delta2
+
+    In percentile mode, delta1/delta2 are percentile cut points over the observed
+    mu_var distribution. This avoids degenerate all-frozen/all-full policies when
+    FlashVSR's activation distribution differs from the paper defaults.
+    """
+
+    if default_mode not in VALID_LAYER_MODES:
+        raise ValueError(f"Unsupported default_mode: {default_mode}")
+    if default_activation_qdq_mode not in VALID_ACTIVATION_QDQ_MODES:
+        raise ValueError(f"Unsupported activation_qdq_mode: {default_activation_qdq_mode}")
+    if threshold_mode not in {"absolute", "percentile"}:
+        raise ValueError(f"Unsupported threshold_mode: {threshold_mode}")
+
+    layer_mu_vars: dict[str, float] = {}
+    for name, entry in calibration_cache.items():
+        if name == "_metadata":
+            continue
+        if not isinstance(entry, dict) or "mu_var" not in entry:
+            raise ValueError(f"Layer {name} is missing required mu_var")
+        layer_mu_vars[name] = float(entry["mu_var"])
+    if not layer_mu_vars:
+        raise ValueError("Calibration cache contains no layer mu_var entries")
+
+    if threshold_mode == "percentile":
+        values = list(layer_mu_vars.values())
+        resolved_delta1 = _percentile(values, delta1)
+        resolved_delta2 = _percentile(values, delta2)
+    else:
+        resolved_delta1 = float(delta1)
+        resolved_delta2 = float(delta2)
+    if resolved_delta1 > resolved_delta2:
+        raise ValueError("delta1 must be <= delta2 after threshold resolution")
+
+    layers: dict[str, dict[str, Any]] = {}
+    counts = {"frozen": 0, "light": 0, "full": 0}
+    for name, mu_var in sorted(layer_mu_vars.items()):
+        if mu_var <= resolved_delta1:
+            tier = "frozen"
+        elif mu_var <= resolved_delta2:
+            tier = "light"
+        else:
+            tier = "full"
+        counts[tier] += 1
+        layers[name] = {
+            "mode": default_mode,
+            "activation_qdq_mode": default_activation_qdq_mode if default_mode.startswith("a8") else None,
+            "tier": tier,
+            "mu_var": mu_var,
+        }
+        if layers[name]["activation_qdq_mode"] is None:
+            del layers[name]["activation_qdq_mode"]
+
+    return {
+        "schema_version": "flashvsr.lsgquant.policy.v1",
+        "scope": "WanVideoDiT Linear layers only; Wan VAE remains unquantized",
+        "default": {"mode": default_mode, "activation_qdq_mode": default_activation_qdq_mode},
+        "thresholds": {
+            "mode": threshold_mode,
+            "delta1": float(delta1),
+            "delta2": float(delta2),
+            "resolved_delta1": resolved_delta1,
+            "resolved_delta2": resolved_delta2,
+        },
+        "tiers": {"frozen": 0, "light": 30, "full": -1},
+        "counts": counts,
+        "layers": layers,
+    }
 
 
 def build_august_mixed_policy(

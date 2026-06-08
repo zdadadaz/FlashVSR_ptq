@@ -707,7 +707,7 @@ def collect_activation_stats_fakequant(
             act = input[0] if isinstance(input, tuple) else input
             act = act.detach().float()
             if name not in act_stats:
-                act_stats[name] = {"min": [], "max": [], "sum": [], "count": []}
+                act_stats[name] = {"min": [], "max": [], "sum": [], "count": [], "mu": []}
             # Per-channel: amin/amax over all dims except last (feature dim)
             dims_to_reduce = list(range(act.dim() - 1))
             act_min = act.amin(dim=dims_to_reduce, keepdim=True)
@@ -720,6 +720,7 @@ def collect_activation_stats_fakequant(
                 reduce_count *= act.shape[dim]
             act_stats[name]["sum"].append(act_sum.cpu())
             act_stats[name]["count"].append(reduce_count)
+            act_stats[name]["mu"].append((act_sum / max(reduce_count, 1)).squeeze().cpu())
         return hook_fn
 
     # ---- Register hooks on every Linear ----
@@ -817,6 +818,7 @@ def collect_activation_stats_fakequant(
             "act_min": act_min.squeeze().float(),
             "act_max": act_max.squeeze().float(),
             "act_mean": act_mean.squeeze().float(),
+            "mu_samples_mean": torch.stack(stats["mu"], dim=0).float(),
         }
     return result
 

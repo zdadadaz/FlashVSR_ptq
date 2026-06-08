@@ -11,6 +11,8 @@ from .fakequant import (
     collect_activation_stats_fakequant,
     get_all_linear_layers,
 )
+from .lsgquant import LSGQuantLinear
+from .qao import QAOResult, convert_model_to_lsgquant_qao, dequantize_weight, qao_decompose_weight, qao_linear_from_float, quantize_weight_symmetric
 
 from .ptq import (
     SymmetricWeightLinear,
@@ -25,8 +27,15 @@ from .smoothquant import (
 )
 
 __all__ = [
-    # FakeQuant (true integer)
+    # FakeQuant / LSGQuant (true integer residual)
     "FakeQuantLinear",
+    "LSGQuantLinear",
+    "QAOResult",
+    "convert_model_to_lsgquant_qao",
+    "qao_decompose_weight",
+    "qao_linear_from_float",
+    "quantize_weight_symmetric",
+    "dequantize_weight",
     "convert_model_to_fakequant",
     "collect_activation_stats_fakequant",
     "get_all_linear_layers",

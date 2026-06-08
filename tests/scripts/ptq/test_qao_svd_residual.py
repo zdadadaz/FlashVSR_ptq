@@ -8,7 +8,9 @@ import torch.nn as nn
 from src.models.quantization.lsgquant import LSGQuantLinear
 from src.models.quantization.qao import (
     QAOResult,
+    convert_model_to_lsgquant_shell,
     dequantize_weight,
+    infer_lsgquant_layer_policy_from_state_dict,
     qao_decompose_weight,
     qao_linear_from_float,
     quantize_weight_symmetric,
@@ -112,6 +114,32 @@ def test_convert_model_to_lsgquant_qao_replaces_linear_layers_and_honors_max_lay
     assert len(layer_errors) == 1
     assert layer_errors[0]["name"] == "0"
     assert layer_errors[0]["error_after"] < layer_errors[0]["error_before"]
+
+
+def test_lsgquant_runtime_shell_infers_policy_and_loads_qao_state_dict():
+    linear = nn.Linear(8, 6, bias=True)
+    module, _ = qao_linear_from_float(
+        linear,
+        weight_bits=4,
+        rank=3,
+        rounds=1,
+        activation_mode="a4",
+        activation_qdq_mode="draq_symmetric",
+    )
+    state = {f"0.{k}": v.clone() for k, v in module.state_dict().items()}
+    model = nn.Sequential(nn.Linear(8, 6, bias=True))
+
+    policy = infer_lsgquant_layer_policy_from_state_dict(model, state)
+    assert policy == {"0": {"mode": "a4w4", "rank": 3, "activation_qdq_mode": "draq_symmetric", "rotation": "identity"}}
+
+    convert_model_to_lsgquant_shell(model, policy)
+    assert isinstance(model[0], LSGQuantLinear)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    assert not missing
+    assert not unexpected
+    assert model[0].rank == 3
+    assert model[0].residual.weight_mode == "w4"
+
 
 
 def test_lsgquant_convert_manifest_records_qao_settings_and_layer_errors(tmp_path):

@@ -2,7 +2,7 @@
 Quantization package for FlashVSR.
 
 Exports FakeQuantLinear for true integer PTQ quantization.
-Supports modes: a16w8, a8w8, a16w4, a8w4
+Supports modes: a16w8, a8w8, a16w4, a8w4, a4w4
 """
 
 from .fakequant import (

@@ -31,6 +31,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from scripts.ptq.fakequant_convert import build_dit, load_calibration_cache, load_checkpoint
 from src.models.quantization.policy import load_layer_policy, layer_policy_entries
 from src.models.quantization.qat import (
+    apply_volts_adaptation_trainability,
+    build_volts_adaptation_plan,
     convert_model_to_qat,
     export_qat_model_to_fakequant,
     freeze_qat_observers,
@@ -139,6 +141,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         layer_policy=layer_policy,
     )
     print(f"[QAT] Conversion summary: {getattr(student, '_qat_conversion_summary', {})}")
+    volts_adaptation_summary: dict[str, Any] = {"enabled": False}
+    if args.volts_adaptation:
+        if layer_policy is None:
+            raise ValueError("--volts_adaptation requires --policy_json with VOLTS tier entries")
+        plan = build_volts_adaptation_plan(load_layer_policy(args.policy_json), light_steps=args.light_steps, full_steps=args.full_steps)
+        trainability = apply_volts_adaptation_trainability(student, layer_policy)
+        volts_adaptation_summary = {"enabled": True, "plan": plan, "trainability": trainability}
+        print(f"[QAT] VOLTS adaptation trainability: {trainability}")
     observer_summary: dict[str, Any] = {"enabled": False, "freeze_step": int(args.observer_freeze_step)}
     use_static_observer = args.activation_qdq_mode == "static_asymmetric" and not args.calibration_cache and args.observer_freeze_step >= 0
     if use_static_observer:
@@ -225,6 +235,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "lr": args.lr,
         "ema_decay": args.ema_decay,
         "observer": observer_summary,
+        "volts_adaptation": volts_adaptation_summary,
         "last_metrics": last_metrics,
         "psnr_gate": "Run fixed eval set and compare against FP16 teacher; target drop <= %.2f dB" % args.target_psnr_drop_db,
     }
@@ -245,6 +256,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", default="a8w8", choices=["a8w8", "a16w8", "a8w4", "a16w4"])
     parser.add_argument("--activation_qdq_mode", default="dynamic_asymmetric", choices=["static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"])
     parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--volts_adaptation", action="store_true", help="Apply VOLTS tier trainability: frozen layers disabled, light/full trainable")
+    parser.add_argument("--light_steps", type=int, default=30, help="VOLTS light-tier adaptation step budget for summary/manifest")
+    parser.add_argument("--full_steps", type=int, default=300, help="VOLTS full-tier adaptation step budget for summary/manifest")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)

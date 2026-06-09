@@ -6,8 +6,9 @@ optional floating-point low-rank branch:
 
     y = linear(qdq(x), W_residual_qdq, bias) + linear(linear(x, L2), L1)
 
-Hadamard rotation and QAO decomposition are intentionally left to later PRs; this
-PR only provides the runtime/state_dict container used by those conversion paths.
+QAO decomposition and optional Hadamard rotation are implemented in
+``src.models.quantization.qao``; this module provides the runtime/state_dict
+container those conversion paths materialize.
 """
 
 from __future__ import annotations

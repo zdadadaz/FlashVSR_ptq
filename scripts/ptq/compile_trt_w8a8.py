@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import torch
+from dataclasses import dataclass
 
 # Add project root to path for imports
 _project_root = Path(__file__).parent.parent.parent
@@ -109,6 +110,50 @@ def make_trt_input_spec():
     )
     return input_spec
 
+
+
+def export_dit_for_trt(model, example_input):
+    """Export a DiT module for TensorRT graph inspection.
+
+    The production INT8 path uses ``torch_tensorrt.dynamo.compile`` directly,
+    but legacy tests and debugging scripts still import this helper to validate
+    that a small WanModel can be captured by ``torch.export``.
+    """
+    model.eval()
+    with torch.no_grad():
+        return torch.export.export(model, example_input)
+
+
+@dataclass
+class _DataLoaderCalibrator:
+    """Minimal DataLoader-backed calibrator descriptor for legacy callers.
+
+    torch_tensorrt 2.x no longer exposes the old Python calibrator classes used
+    by this script's tests. Keep a lightweight object so callers can pass around
+    the calibration loader without importing removed torch_tensorrt APIs.
+    """
+
+    dataloader: object
+    num_samples: int | None = None
+
+    def __iter__(self):
+        count = 0
+        for batch in self.dataloader:
+            if self.num_samples is not None and count >= self.num_samples:
+                break
+            count += 1
+            yield batch
+
+
+def create_trt_calibrator(dataloader, num_samples=None):
+    """Create a DataLoader-backed calibration descriptor.
+
+    This preserves the legacy compile script API while avoiding dependency on
+    removed torch_tensorrt calibrator classes.
+    """
+    if dataloader is None:
+        raise ValueError("dataloader is required")
+    return _DataLoaderCalibrator(dataloader=dataloader, num_samples=num_samples)
 
 def compile_trt_engine(model, output_engine, input_spec):
     """Compile TensorRT engine from pre-quantized W8A8 model using dynamo.compile.

@@ -32,7 +32,7 @@ from src.models.wan_video_dit import WanModel, sinusoidal_embedding_1d
 class CalibrationSample:
     """Single calibration sample with latent-simulated input."""
 
-    latents: torch.Tensor  # (16, 24, 24), bf16
+    latents: torch.Tensor  # (T, 16, H, W), bf16
     timesteps: torch.Tensor  # (1,), int64
     contexts: torch.Tensor  # (10, 4096), bf16
 
@@ -93,8 +93,9 @@ class FlashVSRTQDataset(Dataset):
             dtype=torch.bfloat16
         )
 
-        # Stack num_frames copies for temporal dimension
-        # Output: (num_frames, C, H, W) = (4, 16, 64, 64)
+        # Stack num_frames copies for temporal dimension.
+        # Output: (num_frames, C, H, W), matching run_calibration's
+        # downstream (B, T, C, H, W) batching contract.
         latents = latent.unsqueeze(0).expand(self.num_frames, -1, -1, -1).contiguous()
 
         return CalibrationSample(

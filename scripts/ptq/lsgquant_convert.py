@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""LSGQuant PR6 QAO conversion scaffolding.
+"""LSGQuant QAO conversion CLI.
 
 This script exposes the conversion contract for producing LSGQuant `(WR, L1, L2)`
-checkpoints.  The heavy full-DiT conversion is intentionally conservative: PR6
-adds CPU QAO helpers and a manifest/debug CLI with `--max_layers`; future PRs can
-wire full checkpoint materialization once the model-side policy is finalized.
+checkpoints. It supports manifest-only dry runs and full checkpoint
+materialization with optional `--max_layers` for debug conversions.
 """
 
 from __future__ import annotations

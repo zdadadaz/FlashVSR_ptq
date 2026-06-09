@@ -52,7 +52,7 @@ class TestFlashVSRTQDataset:
         sample = dataset[0]
 
         assert isinstance(sample, CalibrationSample)
-        assert sample.latents.shape == (16, 24, 24)
+        assert sample.latents.shape == (6, 16, 24, 24)
         assert sample.timesteps.shape == (1,)
         assert sample.contexts.shape == (10, 4096)
 

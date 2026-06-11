@@ -849,12 +849,15 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
     # FIX: quantize_mode parameter should drive FakeQuant pipeline selection
     # not just be informational. Map quantize_mode → fq_mode for FakeQuant paths.
     fq_mode = None
-    if quantize_mode in ("FakeQuant_A8W8", "FakeQuant_A8W4", "FakeQuant_A16W8", "FakeQuant_A16W4"):
+    fakequant_modes = ("FakeQuant_A8W8", "FakeQuant_A8W8_DRAQ", "FakeQuant_A8W4", "FakeQuant_A16W8", "FakeQuant_A16W4", "FakeQuant_A4W4")
+    if quantize_mode in fakequant_modes:
         mode_map = {
             "FakeQuant_A8W8": "a8w8",
+            "FakeQuant_A8W8_DRAQ": "a8w8",
             "FakeQuant_A8W4": "a8w4",
             "FakeQuant_A16W8": "a16w8",
             "FakeQuant_A16W4": "a16w4",
+            "FakeQuant_A4W4": "a4w4",
         }
         fq_mode = mode_map[quantize_mode]
         is_fakequant_ckpt = True
@@ -864,10 +867,12 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
         log(f"FakeQuant checkpoint detected: {ckpt_path}", message_type='info', icon="🔍")
         try:
             from .src.models.wan_video_dit import WanModel
-            from .src.models.quantization.fakequant import convert_model_to_fakequant, convert_ops_to_fakequant
+            from .src.models.quantization.fakequant import convert_model_to_fakequant, convert_ops_to_fakequant, infer_fakequant_layer_policy_from_state_dict
+            from .src.models.quantization.qao import convert_model_to_lsgquant_shell, infer_lsgquant_layer_policy_from_state_dict
         except ImportError:
             from src.models.wan_video_dit import WanModel
-            from src.models.quantization.fakequant import convert_model_to_fakequant, convert_ops_to_fakequant
+            from src.models.quantization.fakequant import convert_model_to_fakequant, convert_ops_to_fakequant, infer_fakequant_layer_policy_from_state_dict
+            from src.models.quantization.qao import convert_model_to_lsgquant_shell, infer_lsgquant_layer_policy_from_state_dict
 
         # FlashVSR-v1.1 config
         dit = WanModel(
@@ -881,6 +886,8 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
             detected_fq_mode = "a8w8"
             if "a16w8" in ckpt_path.lower():
                 detected_fq_mode = "a16w8"
+            elif "a4w4" in ckpt_path.lower():
+                detected_fq_mode = "a4w4"
             elif "a8w4" in ckpt_path.lower():
                 detected_fq_mode = "a8w4"
             elif "a16w4" in ckpt_path.lower():
@@ -888,12 +895,9 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
         fq_mode = detected_fq_mode
         log(f"FakeQuant mode: {fq_mode}", message_type='info', icon="🔍")
 
-        # Load state dict first so mixed static PTQ checkpoints can reconstruct
-        # their architecture.  Static mixed baselines may keep 10-20% sensitive
-        # Linear layers as true FP16 nn.Linear (`fp16_skip`), while the rest are
-        # FakeQuantLinear.  If we blindly convert every Linear to FakeQuantLinear,
-        # the skipped `*.weight` tensors become unexpected keys and the fallback
-        # layers run with uninitialized fakequant weights.
+        # Load state dict before FakeQuant module construction so mixed W4/W8
+        # and static-PTQ FP16-fallback checkpoints can infer per-layer modes
+        # from tensor shapes / key presence.
         if ckpt_path.endswith(".safetensors"):
             from safetensors.torch import load_file
             sd_dit = load_file(ckpt_path)
@@ -907,19 +911,40 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
             else:
                 new_sd[k] = v
 
-        inferred_layer_policy = {}
-        for layer_name, layer_module in dit.named_modules():
-            if isinstance(layer_module, torch.nn.Linear):
-                has_fp_weight = f"{layer_name}.weight" in new_sd
-                has_fq_weight = f"{layer_name}.weight_int" in new_sd
-                if has_fp_weight and not has_fq_weight:
-                    inferred_layer_policy[layer_name] = {"mode": "fp16_skip"}
-        if inferred_layer_policy:
-            log(
-                f"Detected mixed FakeQuant checkpoint with {len(inferred_layer_policy)} FP16 fallback Linear layers",
-                message_type='info', icon="🧩",
+        is_lsgquant_qao_ckpt = any(k.endswith(".residual.weight_int") for k in new_sd)
+        if is_lsgquant_qao_ckpt:
+            inferred_policy = infer_lsgquant_layer_policy_from_state_dict(
+                dit, new_sd, default_activation_qdq_mode="draq_symmetric"
             )
-        convert_model_to_fakequant(dit, mode=fq_mode, act_stats=None, layer_policy=inferred_layer_policy or None)
+            if not inferred_policy:
+                raise RuntimeError("LSGQuant QAO checkpoint detected but no Linear layer policy could be inferred")
+            log(f"Inferred LSGQuant QAO per-layer policy from checkpoint: {len(inferred_policy)} layers", message_type='info', icon="🧩")
+            convert_model_to_lsgquant_shell(
+                dit,
+                inferred_policy,
+                activation_qdq_mode="draq_symmetric",
+                draq_qrange="signed_symmetric",
+            )
+        else:
+            inferred_policy = infer_fakequant_layer_policy_from_state_dict(
+                dit, new_sd, default_activation_qdq_mode="draq_symmetric"
+            )
+            if inferred_policy:
+                fp16_skips = sum(1 for entry in inferred_policy.values() if entry.get("mode") == "fp16_skip")
+                log(
+                    f"Inferred FakeQuant per-layer policy from checkpoint: {len(inferred_policy)} layers"
+                    + (f" ({fp16_skips} FP16 fallback)" if fp16_skips else ""),
+                    message_type='info', icon="🧩",
+                )
+                convert_model_to_fakequant(
+                    dit,
+                    mode=fq_mode,
+                    act_stats=None,
+                    layer_policy=inferred_policy,
+                    activation_qdq_mode="draq_symmetric",
+                )
+            else:
+                convert_model_to_fakequant(dit, mode=fq_mode, act_stats=None)
         dit.load_state_dict(new_sd, strict=False)
         dit.eval()
 
@@ -1194,7 +1219,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
         else:
             log("Warning: W8A8_PTQ mode without trt_engine_path - DiT not loaded!", message_type='warning', icon='⚠️')
 
-    elif quantize_mode in ("FakeQuant_A8W8", "FakeQuant_A8W4", "FakeQuant_A16W8", "FakeQuant_A16W4"):
+    elif quantize_mode in fakequant_modes:
         # quantize_mode already drove pipeline creation in the is_fakequant_ckpt branch above.
         # If we reach here with this quantize_mode, it means the checkpoint path
         # didn't contain "fakequant" — we still want to create FakeQuant pipeline

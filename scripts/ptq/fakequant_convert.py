@@ -1,5 +1,5 @@
 """
-Convert FlashVSR DiT checkpoint → FakeQuant PTQ format (a8w8 / a16w8 / a8w4 / a16w4).
+Convert FlashVSR DiT checkpoint → FakeQuant PTQ format (a8w8 / a16w8 / a8w4 / a16w4 / a4w4).
 
 Steps:
   1. Load full-precision WanModel from checkpoint.
@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -146,6 +147,33 @@ def load_smoothquant_cache(cache_path: str, device="cuda"):
     return result
 
 
+def load_lsgquant_layer_policy(path: str | Path):
+    """Load PR-3 LSGQuant policy entries plus a compact summary for manifests."""
+
+    raw = load_layer_policy(path)
+    entries = layer_policy_entries(raw)
+    tier_counts = {}
+    mode_counts = {}
+    for entry in entries.values():
+        tier = entry.get("tier")
+        if tier:
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        mode = entry.get("mode")
+        if mode:
+            mode_counts[mode] = mode_counts.get(mode, 0) + 1
+    summary = {
+        "path": str(path),
+        "schema_version": raw.get("schema_version"),
+        "scope": raw.get("scope"),
+        "default": raw.get("default"),
+        "thresholds": raw.get("thresholds"),
+        "tier_counts": tier_counts,
+        "mode_counts": mode_counts,
+        "layers": len(entries),
+    }
+    return entries, summary
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -160,7 +188,7 @@ def main():
                        help="Output path for quantized checkpoint")
     parser.add_argument(
         "--mode", type=str, default="a8w8",
-        choices=["a16w8", "a8w8", "a16w4", "a8w4"],
+        choices=["a16w8", "a8w8", "a16w4", "a8w4", "a4w4"],
         help="Quantization mode"
     )
     parser.add_argument(
@@ -177,16 +205,26 @@ def main():
         "--activation_qdq_mode", type=str, default="static_asymmetric",
         choices=list(ACTIVATION_QDQ_MODE_TO_ID),
         help=(
-            "A8 activation QDQ policy. static_asymmetric uses calibrated per-channel "
-            "scale/zero_point from --calibration_cache. dynamic_symmetric, "
-            "dynamic_asymmetric and draq_symmetric compute activation scales at runtime. "
+            "Activation QDQ policy. A8 static_asymmetric uses calibrated per-channel "
+            "scale/zero_point from --calibration_cache. dynamic_symmetric and "
+            "dynamic_asymmetric compute per-token activation scales at runtime; "
+            "draq_symmetric uses LSGQuant online channel+token scaling. "
             "draq_static_s, draq_static_sd_layer and draq_static_sd_bucket use "
             "calibration-derived DRAQ static fields."
         ),
     )
     parser.add_argument(
+        "--draq_qrange", type=str, default="signed_symmetric",
+        choices=["signed_symmetric", "signed_full"],
+        help="DRAQ signed int8 clamp range: conservative [-127,127] or paper-style [-128,127]."
+    )
+    parser.add_argument(
         "--policy_json", type=str, default="",
         help="Optional per-layer policy JSON for mixed precision recovery."
+    )
+    parser.add_argument(
+        "--policy", type=str, default="",
+        help="Alias for --policy_json; intended for LSGQuant/VOLTS PR-3 policy files."
     )
     parser.add_argument(
         "--enable_bias_correction", action="store_true",
@@ -225,9 +263,13 @@ def main():
         )
 
     layer_policy = None
-    if args.policy_json:
-        layer_policy = layer_policy_entries(load_layer_policy(args.policy_json))
-        print(f"[Convert] Loaded layer policy for {len(layer_policy)} layers: {args.policy_json}")
+    policy_summary = None
+    policy_path = args.policy or args.policy_json
+    if args.policy and args.policy_json and args.policy != args.policy_json:
+        raise ValueError("Use only one policy path: --policy or --policy_json")
+    if policy_path:
+        layer_policy, policy_summary = load_lsgquant_layer_policy(policy_path)
+        print(f"[Convert] Loaded layer policy for {len(layer_policy)} layers: {policy_path}")
 
     smoothquant_scales = {}
     if args.smoothquant_cache:
@@ -244,6 +286,7 @@ def main():
         act_stats=act_stats,
         static_quality_policy=args.static_quality_policy,
         activation_qdq_mode=args.activation_qdq_mode,
+        draq_qrange=args.draq_qrange,
         layer_policy=layer_policy,
         enable_bias_correction=args.enable_bias_correction,
         smoothquant_scales=smoothquant_scales,
@@ -281,7 +324,9 @@ def main():
         "checkpoint": args.checkpoint,
         "output": args.output,
         "calibration_cache": args.calibration_cache or None,
-        "policy_json": args.policy_json or None,
+        "policy_json": policy_path or None,
+        "policy_summary": policy_summary,
+        "draq_qrange": args.draq_qrange,
         "smoothquant_cache": args.smoothquant_cache or None,
         "weight_rounding": args.weight_rounding,
     })

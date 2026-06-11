@@ -54,6 +54,7 @@ def quant_dequant_activation_ste(
     x: torch.Tensor,
     activation_mode: str = "a8",
     activation_qdq_mode: str = "dynamic_asymmetric",
+    draq_qrange: str = "signed_symmetric",
     act_scale: torch.Tensor | None = None,
     act_zero_point: torch.Tensor | None = None,
     in_features: int | None = None,
@@ -69,6 +70,19 @@ def quant_dequant_activation_ste(
     if activation_qdq_mode == "dynamic_symmetric":
         scale = torch.amax(torch.abs(x_float), dim=-1, keepdim=True).clamp(min=1e-6) / 127.0
         qdq = torch.clamp(torch.round(x_float / scale), -127, 127) * scale
+    elif activation_qdq_mode == "draq_symmetric":
+        if draq_qrange == "signed_full":
+            qmin, qmax = -128.0, 127.0
+        elif draq_qrange == "signed_symmetric":
+            qmin, qmax = -127.0, 127.0
+        else:
+            raise ValueError(f"Unsupported draq_qrange: {draq_qrange}")
+        reduce_channel = tuple(range(x_float.dim() - 1))
+        s = torch.amax(torch.abs(x_float), dim=reduce_channel, keepdim=True).clamp(min=1e-6)
+        x_norm = x_float / s
+        d = torch.amax(torch.abs(x_norm), dim=-1, keepdim=True).clamp(min=1e-6)
+        q = torch.clamp(torch.round(qmax * x_norm / d), qmin, qmax)
+        qdq = (q / qmax) * d * s
     elif activation_qdq_mode == "dynamic_asymmetric":
         qmin, qmax = -128.0, 127.0
         x_min = torch.amin(x_float, dim=-1, keepdim=True)
@@ -117,7 +131,7 @@ class QuantAwareLinear(nn.Module):
             raise ValueError(f"Unsupported activation_mode: {activation_mode}")
         if weight_mode not in ("w8", "w4"):
             raise ValueError(f"Unsupported weight_mode: {weight_mode}")
-        if activation_qdq_mode not in ("static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"):
+        if activation_qdq_mode not in ("static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric", "draq_symmetric"):
             raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
 
         self.in_features = in_features
@@ -400,6 +414,106 @@ def freeze_qat_observers(model: nn.Module) -> dict[str, int]:
         module.freeze_activation_qparams()
         summary["frozen"] += 1
     return summary
+
+
+def build_volts_adaptation_plan(
+    policy: dict[str, Any],
+    light_steps: int = 30,
+    full_steps: int = 300,
+) -> dict[str, Any]:
+    """Build a deterministic layer adaptation plan from a VOLTS tier policy."""
+
+    if light_steps < 0 or full_steps < 0:
+        raise ValueError("light_steps and full_steps must be >= 0")
+    layers = policy.get("layers", policy)
+    plan_layers: dict[str, dict[str, Any]] = {}
+    counts = {"frozen": 0, "light": 0, "full": 0}
+    for name, entry in layers.items():
+        if not isinstance(entry, dict):
+            continue
+        tier = entry.get("tier", "full")
+        if tier not in counts:
+            raise ValueError(f"Unsupported VOLTS adaptation tier for {name}: {tier}")
+        steps = 0 if tier == "frozen" else light_steps if tier == "light" else full_steps
+        counts[tier] += 1
+        plan_layers[name] = {
+            "tier": tier,
+            "steps": int(steps),
+            "mode": entry.get("mode"),
+            "activation_qdq_mode": entry.get("activation_qdq_mode"),
+        }
+    return {
+        "schema_version": "flashvsr.lsgquant.volts_adaptation_plan.v1",
+        "light_steps": int(light_steps),
+        "full_steps": int(full_steps),
+        "layers": plan_layers,
+        "counts": counts,
+    }
+
+
+def apply_volts_adaptation_trainability(model: nn.Module, policy: dict[str, Any]) -> dict[str, int]:
+    """Freeze VOLTS frozen-tier QAT/Linear layers and train light/full tiers."""
+
+    layers = policy.get("layers", policy)
+    by_name = dict(model.named_modules())
+    summary = {"frozen_layers": 0, "trainable_layers": 0, "missing_layers": 0, "parameters_trainable": 0, "parameters_frozen": 0}
+    for name, entry in layers.items():
+        if not isinstance(entry, dict):
+            continue
+        module = by_name.get(name)
+        if module is None:
+            summary["missing_layers"] += 1
+            continue
+        tier = entry.get("tier", "full")
+        trainable = tier in ("light", "full")
+        if tier == "frozen":
+            summary["frozen_layers"] += 1
+        elif trainable:
+            summary["trainable_layers"] += 1
+        else:
+            raise ValueError(f"Unsupported VOLTS adaptation tier for {name}: {tier}")
+        for param in module.parameters(recurse=True):
+            param.requires_grad_(trainable)
+            if trainable:
+                summary["parameters_trainable"] += int(param.numel())
+            else:
+                summary["parameters_frozen"] += int(param.numel())
+    return summary
+
+
+def _model_forward_for_qat_lite(model: nn.Module, batch: dict[str, Any]) -> torch.Tensor:
+    if "input" in batch:
+        return model(batch["input"])
+    if {"x", "timestep", "context"}.issubset(batch):
+        return model(batch["x"], batch["timestep"], batch["context"], use_gradient_checkpointing=False)
+    raise KeyError("QAT-lite batch must contain either 'input' or x/timestep/context")
+
+
+def lsgquant_qat_lite_step(
+    student: nn.Module,
+    teacher: nn.Module,
+    batch: dict[str, Any],
+    optimizer: torch.optim.Optimizer,
+    temporal_loss_weight: float = 0.0,
+) -> dict[str, float]:
+    """Run one FP-teacher distillation step for VOLTS-guided QAT-lite."""
+
+    student.train()
+    teacher.eval()
+    with torch.no_grad():
+        teacher_out = _model_forward_for_qat_lite(teacher, batch)
+    student_out = _model_forward_for_qat_lite(student, batch)
+    distill_loss = F.mse_loss(student_out.float(), teacher_out.float())
+    temporal_loss = temporal_consistency_loss(student_out, teacher_out)
+    loss = distill_loss + float(temporal_loss_weight) * temporal_loss
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    return {
+        "loss": float(loss.detach().cpu()),
+        "distill_loss": float(distill_loss.detach().cpu()),
+        "temporal_loss": float(temporal_loss.detach().cpu()),
+    }
 
 
 def update_ema_model(ema_model: nn.Module, model: nn.Module, decay: float) -> None:

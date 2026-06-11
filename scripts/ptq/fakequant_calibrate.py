@@ -260,6 +260,62 @@ def load_checkpoint(path: str, model: WanModel):
 
 
 # =============================================================================
+# Calibration cache serialization
+# =============================================================================
+
+def _tensor_to_json_list(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().numpy().tolist()
+    return value
+
+
+def _compute_mu_var(mu_samples_mean) -> float:
+    if mu_samples_mean is None:
+        return 0.0
+    mu = mu_samples_mean.detach().cpu().float() if torch.is_tensor(mu_samples_mean) else torch.tensor(mu_samples_mean).float()
+    if mu.numel() == 0 or mu.shape[0] < 2:
+        return 0.0
+    if mu.dim() == 1:
+        return float(mu.var(unbiased=True).item())
+    return float(mu.var(dim=0, unbiased=True).mean().item())
+
+
+def build_lsgquant_calibration_cache(act_stats: dict | None, metadata: dict) -> dict:
+    """Serialize FakeQuant calibration stats with LSGQuant/VOLTS fields.
+
+    Keeps legacy act_scale/zero_point fields for fakequant_convert.py while adding
+    act_min/act_max/act_mean, per-sample channel means, and mu_var for PR-2 policy
+    generation.
+    """
+
+    cache = {"_metadata": dict(metadata)}
+    cache["_metadata"].update({
+        "schema_version": "flashvsr.lsgquant.calibration.v1",
+        "stats": ["act_scale", "zero_point", "act_min", "act_max", "act_mean", "mu_mean", "mu_var"],
+    })
+    if not act_stats:
+        return cache
+
+    for name, s in act_stats.items():
+        entry = {
+            "act_scale": _tensor_to_json_list(s["act_scale"]),
+            "zero_point": _tensor_to_json_list(s["zero_point"]),
+        }
+        for key in ("act_min", "act_max", "act_mean"):
+            if key in s:
+                entry[key] = _tensor_to_json_list(s[key])
+        mu_samples = s.get("mu_samples_mean")
+        if mu_samples is not None:
+            entry["mu_samples_mean"] = _tensor_to_json_list(mu_samples)
+            entry["mu_mean"] = _tensor_to_json_list(torch.as_tensor(mu_samples).float().mean(dim=0))
+            entry["mu_var"] = _compute_mu_var(mu_samples)
+        else:
+            entry["mu_var"] = 0.0
+        cache[name] = entry
+    return cache
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -377,37 +433,24 @@ def main():
     # ------------------------------------------------------------------
     os.makedirs(os.path.dirname(args.output_cache) or ".", exist_ok=True)
 
-    cache = {"_metadata": {
-        "mode": args.mode,
-        "num_samples": args.num_samples,
-        "video": args.video,
-        "dataset_train": args.dataset_train if not args.video else None,
-        "num_videos": len(selected_videos),
-        "seed": args.seed,
-        "selected_videos": selected_videos,
-        "fps_values": fps_values,
-        "latent_size": args.latent_size,
-        "checkpoint": args.checkpoint,
-        "vae_path": args.vae_path,
-        "vae_model": args.vae_model,
-        "calib_frames": args.calib_frames,
-    }}
-
-    if act_stats:
-        for name, s in act_stats.items():
-            entry = {
-                "act_scale": s["act_scale"].cpu().numpy().tolist(),
-                "zero_point": s["zero_point"].cpu().numpy().tolist(),
-            }
-            # Preserve min/max so static per-tensor caches can be derived from
-            # the same calibration run without re-running the DiT forward pass.
-            if "act_min" in s:
-                entry["act_min"] = s["act_min"].cpu().numpy().tolist()
-            if "act_max" in s:
-                entry["act_max"] = s["act_max"].cpu().numpy().tolist()
-            if "act_mean" in s:
-                entry["act_mean"] = s["act_mean"].cpu().numpy().tolist()
-            cache[name] = entry
+    cache = build_lsgquant_calibration_cache(
+        act_stats,
+        metadata={
+            "mode": args.mode,
+            "num_samples": args.num_samples,
+            "video": args.video,
+            "dataset_train": args.dataset_train if not args.video else None,
+            "num_videos": len(selected_videos),
+            "seed": args.seed,
+            "selected_videos": selected_videos,
+            "fps_values": fps_values,
+            "latent_size": args.latent_size,
+            "checkpoint": args.checkpoint,
+            "vae_path": args.vae_path,
+            "vae_model": args.vae_model,
+            "calib_frames": args.calib_frames,
+        },
+    )
 
     with open(args.output_cache, "w") as f:
         json.dump(cache, f, indent=2)

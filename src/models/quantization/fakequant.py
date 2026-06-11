@@ -5,7 +5,7 @@ Implements true integer quantization: activations (int8) and weights (int4/int8)
 are quantized to actual integer types, then immediately dequantized back to float32
 for computation. No bf16/fp16 passthrough — real int8/int4 throughout.
 
-Supports: a16w8, a8w8, a16w4, a8w4
+Supports: a16w8, a8w8, a16w4, a8w4, a4w4
 """
 
 import torch
@@ -173,10 +173,11 @@ class FakeQuantLinear(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        activation_mode: str = "a16",   # "a16" or "a8"
+        activation_mode: str = "a16",   # "a16", "a8", or "a4"
         weight_mode: str = "w8",         # "w8" or "w4"
         act_quant_enabled: bool = True,
         activation_qdq_mode: str = "static_asymmetric",
+        draq_qrange: str = "signed_symmetric",
         bias: bool = True,
         device=None,
         dtype=None,
@@ -184,9 +185,9 @@ class FakeQuantLinear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.activation_mode = activation_mode   # "a16" or "a8"
+        self.activation_mode = activation_mode   # "a16", "a8", or "a4"
         self.weight_mode = weight_mode         # "w8" or "w4"
-        activation_mode_to_id = {"a16": 1, "a8": 2}
+        activation_mode_to_id = {"a16": 1, "a8": 2, "a4": 3}
         if activation_mode not in activation_mode_to_id:
             raise ValueError(f"Unsupported activation_mode: {activation_mode}")
         self.register_buffer(
@@ -227,6 +228,13 @@ class FakeQuantLinear(nn.Module):
             "draq_bucket_index",
             torch.tensor(0, dtype=torch.int32, device=device),
         )
+        draq_qrange_to_id = {"signed_symmetric": 0, "signed_full": 1}
+        if draq_qrange not in draq_qrange_to_id:
+            raise ValueError(f"Unsupported draq_qrange: {draq_qrange}")
+        self.register_buffer(
+            "draq_qrange",
+            torch.tensor(draq_qrange_to_id[draq_qrange], dtype=torch.int32, device=device),
+        )
 
         # ---- Weight buffers ----
         if weight_mode == "w4":
@@ -243,7 +251,7 @@ class FakeQuantLinear(nn.Module):
             torch.ones((out_features, 1), dtype=torch.float32, device=device),
         )
 
-        # ---- Activation per-channel scale / zero-point (a8 mode only) ----
+        # ---- Activation per-channel scale / zero-point (static a8 mode only) ----
         if activation_mode == "a8":
             # Per-channel scale along the feature dim (ch_axis=-1 for [B,Seq,Cin]):
             #   scale shape:  [1, 1, in_features]
@@ -277,11 +285,30 @@ class FakeQuantLinear(nn.Module):
             ).clamp(min=1e-6)
             x_float = x_float * sq_scale
 
-        # ---- (1) Activation quantization → int8 → float32 ----
-        activation_is_a8 = int(self.activation_mode_code.item()) == 2
-        if activation_is_a8 and bool(self.act_quant_enabled.item()):
+        # ---- (1) Activation quantization → integer → float32 ----
+        activation_mode_code = int(self.activation_mode_code.item())
+        activation_is_a8 = activation_mode_code == 2
+        activation_is_a4 = activation_mode_code == 3
+        if (activation_is_a8 or activation_is_a4) and bool(self.act_quant_enabled.item()):
             qdq_mode = int(self.activation_qdq_mode.item())
-            if qdq_mode == 1:
+            if activation_is_a4:
+                if qdq_mode not in (1, 3):
+                    raise ValueError("A4 activation QDQ supports dynamic_symmetric or draq_symmetric modes only")
+                if qdq_mode == 3:
+                    # LSGQuant-style DRAQ with signed int4 qrange [-7, 7].
+                    qmin, qmax = -7.0, 7.0
+                    reduce_channel = tuple(range(x_float.dim() - 1))
+                    s = torch.amax(torch.abs(x_float), dim=reduce_channel, keepdim=True).clamp(min=1e-6)
+                    x_norm = x_float / s
+                    d = torch.amax(torch.abs(x_norm), dim=-1, keepdim=True).clamp(min=1e-6)
+                    x_q = torch.clamp(torch.round(qmax * x_norm / d), qmin, qmax).to(torch.int8)
+                    x_fp = (x_q.to(torch.float32) / qmax) * d * s
+                else:
+                    # Dynamic per-token symmetric signed-int4 activation QDQ.
+                    x_scale = torch.amax(torch.abs(x_float), dim=-1, keepdim=True).clamp(min=1e-6) / 7.0
+                    x_q = torch.clamp(torch.round(x_float / x_scale), -7, 7).to(torch.int8)
+                    x_fp = x_q.to(torch.float32) * x_scale
+            elif qdq_mode == 1:
                 # Dynamic per-token symmetric signed-int8 activation QDQ.
                 x_scale = torch.amax(torch.abs(x_float), dim=-1, keepdim=True).clamp(min=1e-6) / 127.0
                 x_q = torch.clamp(torch.round(x_float / x_scale), -127, 127).to(torch.int8)
@@ -296,10 +323,10 @@ class FakeQuantLinear(nn.Module):
                 x_q = torch.clamp(torch.round(x_float / x_scale + x_zero_point), qmin, qmax).to(torch.int8)
                 x_fp = (x_q.to(torch.float32) - x_zero_point) * x_scale
             elif qdq_mode in (3, 4, 5, 6):
-                # LSGQuant DRAQ-style symmetric QDQ.  Mode 3 computes both
-                # channel scale s_i and token scale d_j online.  Static variants
+                # LSGQuant DRAQ-style symmetric QDQ. Mode 3 computes both
+                # channel scale s_i and token scale d_j online. Static variants
                 # load s_i and/or d from calibration buffers.
-                qmin, qmax = -128.0, 127.0
+                qmin, qmax = (-128.0, 127.0) if int(self.draq_qrange.item()) == 1 else (-127.0, 127.0)
                 if qdq_mode == 3:
                     reduce_channel = tuple(range(x_float.dim() - 1))
                     s = torch.amax(torch.abs(x_float), dim=reduce_channel, keepdim=True).clamp(min=1e-6)
@@ -399,6 +426,7 @@ class FakeQuantLinear(nn.Module):
         draq_d: torch.Tensor = None,
         draq_d_buckets: torch.Tensor = None,
         draq_bucket_index: int = 0,
+        draq_qrange: str = "signed_symmetric",
         weight_rounding: str = "nearest",
         ch_axis: int = -1,   # kept for API compat, unused
     ):
@@ -407,7 +435,7 @@ class FakeQuantLinear(nn.Module):
 
         Args:
             linear_module: source nn.Linear
-            activation_mode: "a16" or "a8"
+            activation_mode: "a16", "a8", or "a4"
             weight_mode: "w8" or "w4"
             act_scale: per-channel activation scale [1, 1, Cin] or [Cin]
             act_zero_point: per-channel zero-point [1, 1, Cin] or [Cin]
@@ -423,6 +451,7 @@ class FakeQuantLinear(nn.Module):
             weight_mode=weight_mode,
             act_quant_enabled=act_quant_enabled,
             activation_qdq_mode=activation_qdq_mode,
+            draq_qrange=draq_qrange,
             bias=linear_module.bias is not None,
             device=device,
             dtype=linear_module.weight.dtype,
@@ -774,6 +803,57 @@ class FakeQuantConv3d(_FakeQuantConvNd):
 # Model conversion
 # ------------------------------------------------------------------
 
+def infer_fakequant_layer_policy_from_state_dict(
+    model,
+    state_dict: dict[str, torch.Tensor],
+    default_activation_qdq_mode: str = "draq_symmetric",
+) -> dict[str, dict[str, str]]:
+    """Infer per-Linear FakeQuant modes from a converted checkpoint state_dict.
+
+    This lets runtime instantiate mixed W4/W8 checkpoints before loading weights.
+    A single global FakeQuant mode is insufficient for policies such as
+    default `a4w4` with sensitive `a16w8`, because packed-W4 and W8
+    `weight_int` tensors have different shapes.
+    """
+
+    activation_id_to_mode = {1: "a16", 2: "a8", 3: "a4"}
+    policy: dict[str, dict[str, str]] = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        weight_key = f"{name}.weight_int"
+        fp_weight_key = f"{name}.weight"
+        activation_key = f"{name}.activation_mode_code"
+        if weight_key not in state_dict:
+            if fp_weight_key in state_dict:
+                policy[name] = {"mode": "fp16_skip"}
+            continue
+        weight_int = state_dict[weight_key]
+        if weight_int.dim() != 2:
+            continue
+        packed_cols = (module.in_features + 1) // 2
+        if weight_int.shape[1] == packed_cols:
+            weight_mode = "w4"
+        elif weight_int.shape[1] == module.in_features:
+            weight_mode = "w8"
+        else:
+            raise ValueError(
+                f"Cannot infer weight mode for {name}: weight_int shape={tuple(weight_int.shape)}, "
+                f"in_features={module.in_features}"
+            )
+
+        activation_mode = "a8"
+        if activation_key in state_dict:
+            activation_code = int(state_dict[activation_key].item())
+            activation_mode = activation_id_to_mode.get(activation_code, activation_mode)
+        mode = f"{activation_mode}{weight_mode}"
+        entry: dict[str, str] = {"mode": mode}
+        if activation_mode in ("a8", "a4"):
+            entry["activation_qdq_mode"] = default_activation_qdq_mode
+        policy[name] = entry
+    return policy
+
+
 def convert_model_to_fakequant(
     model,
     mode: str = "a16w8",
@@ -782,6 +862,7 @@ def convert_model_to_fakequant(
     method: str = "max",
     static_quality_policy: str = "none",
     activation_qdq_mode: str = "static_asymmetric",
+    draq_qrange: str = "signed_symmetric",
     layer_policy: dict | None = None,
     enable_bias_correction: bool = False,
     smoothquant_scales: dict | None = None,
@@ -796,9 +877,11 @@ def convert_model_to_fakequant(
     """
     if activation_qdq_mode not in ACTIVATION_QDQ_MODE_TO_ID:
         raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
+    if draq_qrange not in ("signed_symmetric", "signed_full"):
+        raise ValueError(f"Unsupported draq_qrange: {draq_qrange}")
     if weight_rounding not in ("nearest", "adaround"):
         raise ValueError(f"Unsupported weight_rounding: {weight_rounding}")
-    if not (mode.startswith("a16") or mode.startswith("a8")):
+    if not (mode.startswith("a16") or mode.startswith("a8") or mode.startswith("a4")):
         raise ValueError(f"Unsupported fakequant mode: {mode}")
     default_weight_mode = mode[3:] if mode.startswith("a16") else mode[2:]
     if default_weight_mode not in ("w8", "w4"):
@@ -863,6 +946,9 @@ def convert_model_to_fakequant(
             layer_weight_mode = layer_mode[3:]
         elif layer_mode.startswith("a8"):
             layer_activation_mode = "a8"
+            layer_weight_mode = layer_mode[2:]
+        elif layer_mode.startswith("a4"):
+            layer_activation_mode = "a4"
             layer_weight_mode = layer_mode[2:]
         else:
             raise ValueError(f"Unsupported layer mode for {full_name}: {layer_mode}")
@@ -933,7 +1019,7 @@ def convert_model_to_fakequant(
                 smoothquant_scale = smoothquant_scales.get(leaf)
 
         try:
-            disable_act_q = layer_activation_mode == "a8" and should_disable_activation_quant(full_name)
+            disable_act_q = layer_activation_mode in ("a8", "a4") and should_disable_activation_quant(full_name)
             new_mod = FakeQuantLinear.from_float(
                 module,
                 activation_mode=layer_activation_mode,
@@ -947,6 +1033,7 @@ def convert_model_to_fakequant(
                 draq_s=draq_s,
                 draq_d=draq_d,
                 draq_d_buckets=draq_d_buckets,
+                draq_qrange=draq_qrange,
                 weight_rounding=weight_rounding,
                 ch_axis=ch_axis,
             )
@@ -983,6 +1070,7 @@ def convert_model_to_fakequant(
         "mode_counts": mode_counts,
         "static_quality_policy": static_quality_policy,
         "activation_qdq_mode": activation_qdq_mode,
+        "draq_qrange": draq_qrange,
         "enable_bias_correction": enable_bias_correction,
         "smoothquant_applied": smoothquant_applied,
         "weight_rounding": weight_rounding,
@@ -1045,7 +1133,7 @@ def collect_activation_stats_fakequant(
             act = input[0] if isinstance(input, tuple) else input
             act = act.detach().float()
             if name not in act_stats:
-                act_stats[name] = {"min": [], "max": [], "sum": [], "count": []}
+                act_stats[name] = {"min": [], "max": [], "sum": [], "count": [], "mu": []}
             # Per-channel: amin/amax over all dims except last (feature dim)
             dims_to_reduce = list(range(act.dim() - 1))
             act_min = act.amin(dim=dims_to_reduce, keepdim=True)
@@ -1058,6 +1146,7 @@ def collect_activation_stats_fakequant(
                 reduce_count *= act.shape[dim]
             act_stats[name]["sum"].append(act_sum.cpu())
             act_stats[name]["count"].append(reduce_count)
+            act_stats[name]["mu"].append((act_sum / max(reduce_count, 1)).squeeze().cpu())
         return hook_fn
 
     # ---- Register hooks on every Linear ----
@@ -1155,6 +1244,7 @@ def collect_activation_stats_fakequant(
             "act_min": act_min.squeeze().float(),
             "act_max": act_max.squeeze().float(),
             "act_mean": act_mean.squeeze().float(),
+            "mu_samples_mean": torch.stack(stats["mu"], dim=0).float(),
         }
     return result
 
@@ -1185,6 +1275,8 @@ def convert_ops_to_fakequant(
         activation_mode, weight_mode = "a16", mode[3:]
     elif mode.startswith("a8"):
         activation_mode, weight_mode = "a8", mode[2:]
+    elif mode.startswith("a4"):
+        activation_mode, weight_mode = "a4", mode[2:]
     else:
         raise ValueError(f"Unsupported fakequant mode: {mode}")
     if weight_mode != "w8":

@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.models.wan_video_dit import WanModel
 from src.models.quantization.fakequant import (
+    ACTIVATION_QDQ_MODE_TO_ID,
     FakeQuantLinear,
     convert_model_to_fakequant,
 )
@@ -89,12 +90,59 @@ def load_calibration_cache(cache_path: str, device="cuda"):
     for name, stats in raw.items():
         if name.startswith("_"):
             continue
-        result[name] = {
-            "act_scale": torch.tensor(stats["act_scale"], device=device),
-            "zero_point": torch.tensor(stats["zero_point"], device=device),
-        }
+        result[name] = {}
+        if "act_scale" in stats:
+            result[name]["act_scale"] = torch.tensor(stats["act_scale"], device=device)
+        if "zero_point" in stats:
+            result[name]["zero_point"] = torch.tensor(stats["zero_point"], device=device)
         if "act_mean" in stats:
             result[name]["act_mean"] = torch.tensor(stats["act_mean"], device=device)
+        for key in (
+            "draq_s_absmax",
+            "draq_s_percentile_99",
+            "draq_s_percentile_999",
+            "draq_d_absmax",
+            "draq_d_percentile_99",
+            "draq_d_percentile_999",
+        ):
+            if key in stats:
+                result[name][key] = torch.tensor(stats[key], device=device, dtype=torch.float32)
+        if "draq_d_by_bucket" in stats:
+            raw_buckets = stats["draq_d_by_bucket"]
+            if isinstance(raw_buckets, dict):
+                values = [raw_buckets[k] for k in sorted(raw_buckets, key=lambda item: str(item))]
+            else:
+                values = raw_buckets
+            result[name]["draq_d_by_bucket"] = torch.tensor(values, device=device, dtype=torch.float32)
+        if "mu_var" in stats:
+            result[name]["mu_var"] = stats["mu_var"]
+        if "volts_tier" in stats:
+            result[name]["volts_tier"] = stats["volts_tier"]
+    return result
+
+
+def load_smoothquant_cache(cache_path: str, device="cuda"):
+    """Load per-layer SmoothQuant migration scales from JSON.
+
+    Accepted entry shapes:
+      {"layer": {"smoothquant_scale": [...]}}
+      {"layer": {"scale": [...]}}
+      {"layer": [...]}
+    """
+    if not cache_path or not os.path.exists(cache_path):
+        return {}
+    with open(cache_path, "r") as f:
+        raw = json.load(f)
+    result = {}
+    for name, entry in raw.items():
+        if name.startswith("_"):
+            continue
+        value = entry
+        if isinstance(entry, dict):
+            value = entry.get("smoothquant_scale", entry.get("scale"))
+        if value is None:
+            continue
+        result[name] = torch.tensor(value, device=device, dtype=torch.float32)
     return result
 
 
@@ -127,11 +175,13 @@ def main():
     )
     parser.add_argument(
         "--activation_qdq_mode", type=str, default="static_asymmetric",
-        choices=["static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"],
+        choices=list(ACTIVATION_QDQ_MODE_TO_ID),
         help=(
             "A8 activation QDQ policy. static_asymmetric uses calibrated per-channel "
-            "scale/zero_point from --calibration_cache. dynamic_symmetric and "
-            "dynamic_asymmetric compute per-token activation scales at runtime."
+            "scale/zero_point from --calibration_cache. dynamic_symmetric, "
+            "dynamic_asymmetric and draq_symmetric compute activation scales at runtime. "
+            "draq_static_s, draq_static_sd_layer and draq_static_sd_bucket use "
+            "calibration-derived DRAQ static fields."
         ),
     )
     parser.add_argument(
@@ -141,6 +191,14 @@ def main():
     parser.add_argument(
         "--enable_bias_correction", action="store_true",
         help="Apply activation-mean-based deterministic bias correction when act_mean exists in calibration cache."
+    )
+    parser.add_argument(
+        "--smoothquant_cache", type=str, default="",
+        help="Optional JSON containing per-layer SmoothQuant migration scales."
+    )
+    parser.add_argument(
+        "--weight_rounding", type=str, default="nearest", choices=["nearest", "adaround"],
+        help="Weight rounding method. 'adaround' uses calibration act_mean for deterministic AdaRound-lite rounding."
     )
     args = parser.parse_args()
 
@@ -159,16 +217,22 @@ def main():
     if args.calibration_cache:
         act_stats = load_calibration_cache(args.calibration_cache)
         print(f"[Convert] Loaded calibration for {len(act_stats)} layers")
-    if args.mode.startswith("a8") and args.activation_qdq_mode == "static_asymmetric" and not act_stats:
+    static_cache_modes = {"static_asymmetric", "draq_static_s", "draq_static_sd_layer", "draq_static_sd_bucket"}
+    if args.mode.startswith("a8") and args.activation_qdq_mode in static_cache_modes and not act_stats:
         raise RuntimeError(
-            f"Mode {args.mode} with static_asymmetric activation QDQ requires a non-empty "
-            "--calibration_cache with calibrated act_scale and zero_point entries."
+            f"Mode {args.mode} with {args.activation_qdq_mode} activation QDQ requires a non-empty "
+            "--calibration_cache with calibrated activation entries."
         )
 
     layer_policy = None
     if args.policy_json:
         layer_policy = layer_policy_entries(load_layer_policy(args.policy_json))
         print(f"[Convert] Loaded layer policy for {len(layer_policy)} layers: {args.policy_json}")
+
+    smoothquant_scales = {}
+    if args.smoothquant_cache:
+        smoothquant_scales = load_smoothquant_cache(args.smoothquant_cache)
+        print(f"[Convert] Loaded SmoothQuant scales for {len(smoothquant_scales)} layers")
 
     # ------------------------------------------------------------------
     # 3. Convert nn.Linear → FakeQuantLinear
@@ -182,6 +246,8 @@ def main():
         activation_qdq_mode=args.activation_qdq_mode,
         layer_policy=layer_policy,
         enable_bias_correction=args.enable_bias_correction,
+        smoothquant_scales=smoothquant_scales,
+        weight_rounding=args.weight_rounding,
     )
 
     # ------------------------------------------------------------------
@@ -216,6 +282,8 @@ def main():
         "output": args.output,
         "calibration_cache": args.calibration_cache or None,
         "policy_json": args.policy_json or None,
+        "smoothquant_cache": args.smoothquant_cache or None,
+        "weight_rounding": args.weight_rounding,
     })
     summary_path = f"{args.output}.conversion_summary.json"
     with open(summary_path, "w") as f:

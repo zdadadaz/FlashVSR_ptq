@@ -11,7 +11,135 @@ Supports: a16w8, a8w8, a16w4, a8w4
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import Counter
 from ..wan_video_dit import sinusoidal_embedding_1d
+
+
+ACTIVATION_QDQ_MODE_TO_ID = {
+    "static_asymmetric": 0,
+    "dynamic_symmetric": 1,
+    "dynamic_asymmetric": 2,
+    "draq_symmetric": 3,
+    "draq_static_s": 4,
+    "draq_static_sd_layer": 5,
+    "draq_static_sd_bucket": 6,
+}
+
+DRAQ_STATIC_MODES = {"draq_static_s", "draq_static_sd_layer", "draq_static_sd_bucket"}
+
+
+def _to_tensor(value, *, device=None, dtype=torch.float32):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device=device, dtype=dtype)
+    return torch.tensor(value, device=device, dtype=dtype)
+
+
+def _tensor_percentile(values: torch.Tensor, q: float) -> torch.Tensor:
+    if values.numel() == 0:
+        return torch.tensor(0.0, dtype=torch.float32)
+    return torch.quantile(values.to(torch.float32), q / 100.0)
+
+
+def build_draq_static_cache_entry(
+    activation_samples,
+    bucket_ids=None,
+    delta1: float = 0.001,
+    delta2: float = 0.075,
+) -> dict:
+    """Build one layer's static-DRAQ/VOLTS cache entry from activation samples.
+
+    This CPU-friendly helper is intentionally independent of WanModel/CUDA so the
+    cache schema and sensitivity math can be unit-tested with synthetic tensors.
+    Each sample is interpreted as a Linear input with channel dimension last.
+    """
+    samples = [s.detach().to(torch.float32).cpu() for s in activation_samples]
+    if not samples:
+        raise ValueError("activation_samples must be non-empty")
+    feature_dim = samples[0].shape[-1]
+    if any(s.shape[-1] != feature_dim for s in samples):
+        raise ValueError("all activation samples must share the same last-dim feature size")
+
+    s_values = []
+    d_values = []
+    mu_samples = []
+    bucket_values = {}
+    bucket_ids = list(bucket_ids or [None] * len(samples))
+    if len(bucket_ids) != len(samples):
+        raise ValueError("bucket_ids length must match activation_samples length")
+
+    for sample, bucket_id in zip(samples, bucket_ids):
+        reduce_channel = tuple(range(sample.dim() - 1))
+        s = torch.amax(torch.abs(sample), dim=reduce_channel).clamp(min=1e-6)
+        x_norm = sample / s.reshape(*([1] * (sample.dim() - 1)), feature_dim)
+        d = torch.amax(torch.abs(x_norm), dim=-1).reshape(-1).clamp(min=1e-6)
+        s_values.append(s)
+        d_values.append(d)
+        mu_samples.append(sample.mean(dim=-1).mean().reshape(()))
+        if bucket_id is not None:
+            bucket_values.setdefault(str(bucket_id), []).append(d)
+
+    stacked_s = torch.stack(s_values, dim=0)
+    all_d = torch.cat(d_values, dim=0)
+    mu_tensor = torch.stack(mu_samples).to(torch.float32)
+    mu_var = torch.var(mu_tensor, unbiased=False).item() if mu_tensor.numel() > 1 else 0.0
+    if mu_var < delta1:
+        tier = "frozen"
+    elif mu_var < delta2:
+        tier = "light"
+    else:
+        tier = "full"
+
+    entry = {
+        "draq_s_absmax": torch.amax(stacked_s, dim=0).tolist(),
+        "draq_s_percentile_99": torch.quantile(stacked_s, 0.99, dim=0).tolist(),
+        "draq_s_percentile_999": torch.quantile(stacked_s, 0.999, dim=0).tolist(),
+        "draq_d_absmax": float(torch.amax(all_d).item()),
+        "draq_d_percentile_99": float(_tensor_percentile(all_d, 99.0).item()),
+        "draq_d_percentile_999": float(_tensor_percentile(all_d, 99.9).item()),
+        "mu_samples_mean": [float(v.item()) for v in mu_tensor],
+        "mu_mean": float(torch.mean(mu_tensor).item()),
+        "mu_var": float(mu_var),
+        "volts_tier": tier,
+    }
+    if bucket_values:
+        entry["draq_d_by_bucket"] = {
+            name: float(_tensor_percentile(torch.cat(vals, dim=0), 99.9).item())
+            for name, vals in bucket_values.items()
+        }
+    return entry
+
+
+def build_volts_draq_policy(calibration_cache: dict) -> dict:
+    """Map VOLTS tiers to a mixed static/dynamic DRAQ layer policy."""
+    tier_to_policy = {
+        "frozen": {"mode": "a8w8", "activation_qdq_mode": "draq_static_sd_layer"},
+        "light": {"mode": "a8w8", "activation_qdq_mode": "draq_static_s"},
+        "full": {"mode": "a8w8", "activation_qdq_mode": "draq_symmetric"},
+        "catastrophic": {"mode": "a16w8", "activation_qdq_mode": "draq_symmetric"},
+    }
+    layers = {}
+    mode_counts = Counter()
+    qdq_counts = Counter()
+    for name, entry in calibration_cache.items():
+        if str(name).startswith("_"):
+            continue
+        tier = entry.get("volts_tier", "light") if isinstance(entry, dict) else "light"
+        layer_policy = dict(tier_to_policy.get(tier, tier_to_policy["light"]))
+        layer_policy["volts_tier"] = tier
+        layers[name] = layer_policy
+        mode_counts[layer_policy["mode"]] += 1
+        qdq_counts[layer_policy["activation_qdq_mode"]] += 1
+    return {
+        "schema_version": "flashvsr.lsgquant.draq_static_policy.v1",
+        "layers": layers,
+        "summary": {
+            "num_layers": len(layers),
+            "mode_counts": dict(mode_counts),
+            "activation_qdq_mode_counts": dict(qdq_counts),
+        },
+    }
 
 
 # ------------------------------------------------------------------
@@ -69,16 +197,35 @@ class FakeQuantLinear(nn.Module):
             "act_quant_enabled",
             torch.tensor(bool(act_quant_enabled), dtype=torch.bool, device=device),
         )
-        qdq_mode_to_id = {
-            "static_asymmetric": 0,
-            "dynamic_symmetric": 1,
-            "dynamic_asymmetric": 2,
-        }
-        if activation_qdq_mode not in qdq_mode_to_id:
+        if activation_qdq_mode not in ACTIVATION_QDQ_MODE_TO_ID:
             raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
         self.register_buffer(
             "activation_qdq_mode",
-            torch.tensor(qdq_mode_to_id[activation_qdq_mode], dtype=torch.int32, device=device),
+            torch.tensor(ACTIVATION_QDQ_MODE_TO_ID[activation_qdq_mode], dtype=torch.int32, device=device),
+        )
+        self.register_buffer(
+            "smoothquant_enabled",
+            torch.tensor(False, dtype=torch.bool, device=device),
+        )
+        self.register_buffer(
+            "smoothquant_scale",
+            torch.ones(1, 1, in_features, dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "draq_s",
+            torch.ones(1, 1, in_features, dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "draq_d",
+            torch.ones(1, dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "draq_d_buckets",
+            torch.ones(1, dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "draq_bucket_index",
+            torch.tensor(0, dtype=torch.int32, device=device),
         )
 
         # ---- Weight buffers ----
@@ -123,11 +270,16 @@ class FakeQuantLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
+        x_float = x.detach().to(torch.float32)
+        if bool(self.smoothquant_enabled.item()):
+            sq_scale = self.smoothquant_scale.to(device=x.device, dtype=torch.float32).reshape(
+                *([1] * (x.dim() - 1)), self.in_features
+            ).clamp(min=1e-6)
+            x_float = x_float * sq_scale
 
         # ---- (1) Activation quantization → int8 → float32 ----
         activation_is_a8 = int(self.activation_mode_code.item()) == 2
         if activation_is_a8 and bool(self.act_quant_enabled.item()):
-            x_float = x.detach().to(torch.float32)
             qdq_mode = int(self.activation_qdq_mode.item())
             if qdq_mode == 1:
                 # Dynamic per-token symmetric signed-int8 activation QDQ.
@@ -143,6 +295,32 @@ class FakeQuantLinear(nn.Module):
                 x_zero_point = torch.round(qmin - x_min / x_scale).clamp(qmin, qmax)
                 x_q = torch.clamp(torch.round(x_float / x_scale + x_zero_point), qmin, qmax).to(torch.int8)
                 x_fp = (x_q.to(torch.float32) - x_zero_point) * x_scale
+            elif qdq_mode in (3, 4, 5, 6):
+                # LSGQuant DRAQ-style symmetric QDQ.  Mode 3 computes both
+                # channel scale s_i and token scale d_j online.  Static variants
+                # load s_i and/or d from calibration buffers.
+                qmin, qmax = -128.0, 127.0
+                if qdq_mode == 3:
+                    reduce_channel = tuple(range(x_float.dim() - 1))
+                    s = torch.amax(torch.abs(x_float), dim=reduce_channel, keepdim=True).clamp(min=1e-6)
+                else:
+                    s = self.draq_s.to(device=x.device, dtype=torch.float32).reshape(
+                        *([1] * (x.dim() - 1)), self.in_features
+                    ).clamp(min=1e-6)
+                x_norm = x_float / s
+                if qdq_mode in (3, 4):
+                    d = torch.amax(torch.abs(x_norm), dim=-1, keepdim=True).clamp(min=1e-6)
+                elif qdq_mode == 5:
+                    d = self.draq_d.to(device=x.device, dtype=torch.float32).reshape(
+                        *([1] * x.dim())
+                    ).clamp(min=1e-6)
+                else:
+                    buckets = self.draq_d_buckets.to(device=x.device, dtype=torch.float32).reshape(-1)
+                    idx = int(self.draq_bucket_index.item())
+                    idx = max(0, min(idx, buckets.numel() - 1))
+                    d = buckets[idx].reshape(*([1] * x.dim())).clamp(min=1e-6)
+                x_q = torch.clamp(torch.round(qmax * x_norm / d), qmin, qmax).to(torch.int8)
+                x_fp = (x_q.to(torch.float32) / qmax) * d * s
             else:
                 # Static calibrated signed-int8 activation QDQ.
                 # act_scale / act_zero_point are collected by fakequant_calibrate.py
@@ -158,7 +336,7 @@ class FakeQuantLinear(nn.Module):
                 x_fp = (x_q.to(torch.float32) - x_zero_point) * x_scale
         else:
             # a16: no-op, just promote to float for matmul
-            x_fp = x.float()
+            x_fp = x_float
 
         # ---- (2) Weight dequantization → float32 ----
         w_fp = self._dequantize_weight(x.device)
@@ -216,6 +394,12 @@ class FakeQuantLinear(nn.Module):
         act_mean: torch.Tensor = None,
         act_quant_enabled: bool = True,
         activation_qdq_mode: str = "static_asymmetric",
+        smoothquant_scale: torch.Tensor = None,
+        draq_s: torch.Tensor = None,
+        draq_d: torch.Tensor = None,
+        draq_d_buckets: torch.Tensor = None,
+        draq_bucket_index: int = 0,
+        weight_rounding: str = "nearest",
         ch_axis: int = -1,   # kept for API compat, unused
     ):
         """
@@ -244,14 +428,83 @@ class FakeQuantLinear(nn.Module):
             dtype=linear_module.weight.dtype,
         )
 
-        w = linear_module.weight.data  # [out, in]
+        if weight_rounding not in ("nearest", "adaround"):
+            raise ValueError(f"Unsupported weight_rounding: {weight_rounding}")
+
+        def _as_float_tensor(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.detach().to(device=device, dtype=torch.float32)
+            return torch.tensor(value, device=device, dtype=torch.float32)
+
+        def _as_int_tensor(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.detach().to(device=device, dtype=torch.int32)
+            return torch.tensor(value, device=device, dtype=torch.int32)
+
+        act_scale = _as_float_tensor(act_scale)
+        act_zero_point = _as_int_tensor(act_zero_point)
+        act_mean = _as_float_tensor(act_mean)
+        smoothquant_scale = _as_float_tensor(smoothquant_scale)
+        draq_s = _as_float_tensor(draq_s)
+        draq_d = _as_float_tensor(draq_d)
+        draq_d_buckets = _as_float_tensor(draq_d_buckets)
+
+        w = linear_module.weight.data.to(torch.float32)  # [out, in]
+        sq = None
+        if smoothquant_scale is not None:
+            sq = smoothquant_scale.reshape(-1).clamp(min=1e-6)
+            if sq.numel() != linear_module.in_features:
+                raise ValueError(
+                    f"smoothquant_scale has {sq.numel()} values, expected {linear_module.in_features}"
+                )
+            w_for_quant = w / sq.reshape(1, -1)
+            new_module.smoothquant_enabled.fill_(True)
+            new_module.smoothquant_scale.copy_(sq.reshape(1, 1, -1))
+        else:
+            w_for_quant = w
+
+        def _round_to_int(values: torch.Tensor, scale: torch.Tensor, qmin: int, qmax: int) -> torch.Tensor:
+            scaled = values / scale
+            nearest = torch.clamp(torch.round(scaled), qmin, qmax)
+            if weight_rounding != "adaround":
+                return nearest.to(torch.int8)
+            # AdaRound-lite: data-aware deterministic rounding. Start from nearest
+            # rounding, then apply one vectorized floor/ceil correction per output
+            # row if it reduces expected output bias E[x] @ (W_fp - W_qdq)^T.
+            # This keeps conversion tractable for large DiT FFN matrices while
+            # still using calibration `act_mean` instead of pure nearest rounding.
+            if act_mean is None:
+                return nearest.to(torch.int8)
+            x_mean = act_mean.reshape(-1)
+            if x_mean.numel() != values.shape[1]:
+                return nearest.to(torch.int8)
+            lower = torch.clamp(torch.floor(scaled), qmin, qmax)
+            upper = torch.clamp(lower + 1, qmin, qmax)
+            residual = torch.sum((values - nearest * scale) * x_mean.reshape(1, -1), dim=1, keepdim=True)
+            candidates = torch.where(residual > 0, upper, lower)
+            delta_q = candidates - nearest
+            delta = delta_q * scale * x_mean.reshape(1, -1)
+            valid = delta_q != 0
+            improvement = torch.abs(residual) - torch.abs(residual - delta)
+            improvement = torch.where(valid, improvement, torch.full_like(improvement, -float("inf")))
+            best_improvement, best_idx = torch.max(improvement, dim=1)
+            rounded = nearest.clone()
+            rows = torch.arange(values.shape[0], device=values.device)
+            do_flip = best_improvement > 0
+            if torch.any(do_flip):
+                rounded[rows[do_flip], best_idx[do_flip]] = candidates[rows[do_flip], best_idx[do_flip]]
+            return torch.clamp(rounded, qmin, qmax).to(torch.int8)
 
         # ---- Weight quantization ----
         if weight_mode == "w4":
             # Symmetric int4: range [-7, 7] per output channel
-            w_max = torch.amax(torch.abs(w), dim=1, keepdim=True)
+            w_max = torch.amax(torch.abs(w_for_quant), dim=1, keepdim=True)
             w_scale = (w_max / 7.0).clamp(min=1e-6)
-            w_int4 = torch.round(w / w_scale).to(torch.int8)
+            w_int4 = _round_to_int(w_for_quant, w_scale, -7, 7)
 
             in_f = linear_module.in_features
             out_f = linear_module.out_features
@@ -268,11 +521,19 @@ class FakeQuantLinear(nn.Module):
             new_module.weight_scale.copy_(w_scale)
         else:
             # Symmetric int8: range [-127, 127] per output channel
-            w_max = torch.amax(torch.abs(w), dim=1, keepdim=True)
+            w_max = torch.amax(torch.abs(w_for_quant), dim=1, keepdim=True)
             w_scale = (w_max / 127.0).clamp(min=1e-6)
-            w_int8 = torch.round(w / w_scale).to(torch.int8)
+            w_int8 = _round_to_int(w_for_quant, w_scale, -127, 127)
             new_module.weight_int.copy_(w_int8)
             new_module.weight_scale.copy_(w_scale)
+
+        if draq_s is not None:
+            new_module.set_draq_static_params(
+                s=draq_s,
+                d=draq_d,
+                d_buckets=draq_d_buckets,
+                bucket_index=draq_bucket_index,
+            )
 
         # ---- Bias correction ----
         # Lightweight PTQ recovery: if calibration provides per-input-channel
@@ -280,10 +541,12 @@ class FakeQuantLinear(nn.Module):
         # E[x] @ (W_fp - W_qdq)^T. This is deterministic and training-free.
         bias_correction = None
         if act_mean is not None:
-            x_mean = act_mean.detach().to(device=device, dtype=torch.float32).reshape(-1)
+            x_mean = act_mean.reshape(-1)
             if x_mean.numel() == linear_module.in_features:
                 w_deq = new_module._dequantize_weight(device).to(torch.float32)
-                bias_correction = torch.matmul(x_mean, (w.to(torch.float32) - w_deq).t())
+                if sq is not None:
+                    x_mean = x_mean * sq
+                bias_correction = torch.matmul(x_mean, (w_for_quant.to(torch.float32) - w_deq).t())
 
         # ---- Activation calibration ----
         if activation_mode == "a8" and act_scale is not None:
@@ -291,12 +554,24 @@ class FakeQuantLinear(nn.Module):
             # Per-tensor static caches store a single scalar/list entry; expand
             # that scalar to all input channels so the runtime QDQ path remains
             # unchanged and checkpoint loading stays compatible.
-            if act_scale.numel() == 1:
-                new_module.act_scale.copy_(act_scale.reshape(1, 1, 1).expand_as(new_module.act_scale))
-            elif act_scale.dim() == 1:
-                new_module.act_scale.copy_(act_scale.view(1, 1, -1))
+            #
+            # SmoothQuant migrates channel scale from weight into activation at
+            # runtime: x' = x * sq, W' = W / sq. Static activation qparams must
+            # therefore describe x', not the pre-SmoothQuant x distribution. For
+            # positive per-channel sq, min/max and scale multiply by sq while the
+            # signed asymmetric zero-point remains unchanged.
+            act_scale_to_store = act_scale
+            if sq is not None:
+                if act_scale_to_store.numel() == 1:
+                    act_scale_to_store = act_scale_to_store.reshape(1) * sq
+                else:
+                    act_scale_to_store = act_scale_to_store.reshape(-1) * sq
+            if act_scale_to_store.numel() == 1:
+                new_module.act_scale.copy_(act_scale_to_store.reshape(1, 1, 1).expand_as(new_module.act_scale))
+            elif act_scale_to_store.dim() == 1:
+                new_module.act_scale.copy_(act_scale_to_store.view(1, 1, -1))
             else:
-                new_module.act_scale.copy_(act_scale)
+                new_module.act_scale.copy_(act_scale_to_store)
 
             if act_zero_point is not None:
                 if act_zero_point.numel() == 1:
@@ -338,6 +613,38 @@ class FakeQuantLinear(nn.Module):
                 self.act_zero_point.copy_(zero_point.view(1, 1, -1))
             else:
                 self.act_zero_point.copy_(zero_point)
+
+    def set_draq_static_params(
+        self,
+        s: torch.Tensor = None,
+        d: torch.Tensor = None,
+        d_buckets: torch.Tensor = None,
+        bucket_index: int = 0,
+    ):
+        """Set calibration-derived DRAQ static buffers."""
+        if s is not None:
+            s = _to_tensor(s, device=self.draq_s.device, dtype=torch.float32).reshape(-1)
+            if s.numel() == 1:
+                s = s.expand(self.in_features)
+            if s.numel() != self.in_features:
+                raise ValueError(f"draq_s has {s.numel()} values, expected {self.in_features}")
+            self.draq_s.copy_(s.reshape(1, 1, -1).clamp(min=1e-6))
+        if d is not None:
+            d = _to_tensor(d, device=self.draq_d.device, dtype=torch.float32).reshape(-1)
+            if d.numel() != 1:
+                raise ValueError("draq_d must be scalar for draq_static_sd_layer")
+            self.draq_d.copy_(d.clamp(min=1e-6))
+        if d_buckets is not None:
+            buckets = _to_tensor(d_buckets, device=self.draq_d_buckets.device, dtype=torch.float32).reshape(-1)
+            if buckets.numel() == 0:
+                raise ValueError("draq_d_buckets must be non-empty")
+            buckets = buckets.clamp(min=1e-6)
+            if buckets.numel() <= self.draq_d_buckets.numel():
+                self.draq_d_buckets.fill_(1.0)
+                self.draq_d_buckets[:buckets.numel()].copy_(buckets)
+            else:
+                self.draq_d_buckets = buckets
+        self.draq_bucket_index.fill_(int(bucket_index))
 
 
 
@@ -470,13 +777,15 @@ class FakeQuantConv3d(_FakeQuantConvNd):
 def convert_model_to_fakequant(
     model,
     mode: str = "a16w8",
-    act_stats: dict = None,
+    act_stats: dict | None = None,
     ch_axis: int = -1,
     method: str = "max",
     static_quality_policy: str = "none",
     activation_qdq_mode: str = "static_asymmetric",
     layer_policy: dict | None = None,
     enable_bias_correction: bool = False,
+    smoothquant_scales: dict | None = None,
+    weight_rounding: str = "nearest",
 ):
     """Recursively replace nn.Linear → FakeQuantLinear.
 
@@ -485,8 +794,10 @@ def convert_model_to_fakequant(
     and `fp16_skip` at per-Linear granularity while preserving the existing
     global-mode behavior when omitted.
     """
-    if activation_qdq_mode not in ("static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"):
+    if activation_qdq_mode not in ACTIVATION_QDQ_MODE_TO_ID:
         raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
+    if weight_rounding not in ("nearest", "adaround"):
+        raise ValueError(f"Unsupported weight_rounding: {weight_rounding}")
     if not (mode.startswith("a16") or mode.startswith("a8")):
         raise ValueError(f"Unsupported fakequant mode: {mode}")
     default_weight_mode = mode[3:] if mode.startswith("a16") else mode[2:]
@@ -499,6 +810,7 @@ def convert_model_to_fakequant(
     act_disabled = 0
     skipped_fp16 = 0
     mode_counts = {}
+    smoothquant_applied = 0
 
     def should_disable_activation_quant(full_name: str) -> bool:
         if static_quality_policy in (None, "", "none"):
@@ -540,7 +852,7 @@ def convert_model_to_fakequant(
             entry.get("activation_qdq_mode", activation_qdq_mode)
             if isinstance(entry, dict) else activation_qdq_mode
         )
-        if layer_qdq_mode not in ("static_asymmetric", "dynamic_symmetric", "dynamic_asymmetric"):
+        if layer_qdq_mode not in ACTIVATION_QDQ_MODE_TO_ID:
             raise ValueError(f"Unsupported activation_qdq_mode for {full_name}: {layer_qdq_mode}")
         if layer_mode == "fp16_skip":
             skipped_fp16 += 1
@@ -558,6 +870,7 @@ def convert_model_to_fakequant(
             raise ValueError(f"Unsupported layer weight mode for {full_name}: {layer_weight_mode}")
 
         act_scale, act_zp, act_mean = None, None, None
+        draq_s, draq_d, draq_d_buckets = None, None, None
         if act_stats:
             s = None
             if full_name in act_stats:
@@ -572,6 +885,13 @@ def convert_model_to_fakequant(
                     act_scale = s.get("act_scale", None)
                 act_zp = s.get("zero_point", None)
                 act_mean = s.get("act_mean", None)
+                draq_s = s.get("draq_s_percentile_999", None)
+                if draq_s is None:
+                    draq_s = s.get("draq_s_percentile_99", s.get("draq_s_absmax", None))
+                draq_d = s.get("draq_d_percentile_999", None)
+                if draq_d is None:
+                    draq_d = s.get("draq_d_percentile_99", s.get("draq_d_absmax", None))
+                draq_d_buckets = s.get("draq_d_by_bucket", None)
         if (
             layer_activation_mode == "a8"
             and layer_qdq_mode == "static_asymmetric"
@@ -580,6 +900,37 @@ def convert_model_to_fakequant(
         ):
             missing_act_stats.append(full_name)
             continue
+        if (
+            layer_activation_mode == "a8"
+            and layer_qdq_mode in DRAQ_STATIC_MODES
+            and act_stats is not None
+            and draq_s is None
+        ):
+            missing_act_stats.append(full_name)
+            continue
+        if (
+            layer_activation_mode == "a8"
+            and layer_qdq_mode == "draq_static_sd_layer"
+            and act_stats is not None
+            and draq_d is None
+        ):
+            missing_act_stats.append(full_name)
+            continue
+        if (
+            layer_activation_mode == "a8"
+            and layer_qdq_mode == "draq_static_sd_bucket"
+            and act_stats is not None
+            and draq_d_buckets is None
+        ):
+            missing_act_stats.append(full_name)
+            continue
+
+        smoothquant_scale = None
+        if smoothquant_scales:
+            smoothquant_scale = smoothquant_scales.get(full_name)
+            if smoothquant_scale is None:
+                leaf = full_name.rsplit(".", 1)[-1] if "." in full_name else full_name
+                smoothquant_scale = smoothquant_scales.get(leaf)
 
         try:
             disable_act_q = layer_activation_mode == "a8" and should_disable_activation_quant(full_name)
@@ -589,9 +940,14 @@ def convert_model_to_fakequant(
                 weight_mode=layer_weight_mode,
                 act_scale=act_scale,
                 act_zero_point=act_zp,
-                act_mean=act_mean if enable_bias_correction else None,
+                act_mean=act_mean if enable_bias_correction or weight_rounding == "adaround" else None,
                 act_quant_enabled=not disable_act_q,
                 activation_qdq_mode=layer_qdq_mode,
+                smoothquant_scale=smoothquant_scale,
+                draq_s=draq_s,
+                draq_d=draq_d,
+                draq_d_buckets=draq_d_buckets,
+                weight_rounding=weight_rounding,
                 ch_axis=ch_axis,
             )
             parent, leaf_name = get_parent_and_name(model, full_name)
@@ -600,6 +956,8 @@ def convert_model_to_fakequant(
             mode_counts[layer_mode] = mode_counts.get(layer_mode, 0) + 1
             if disable_act_q:
                 act_disabled += 1
+            if smoothquant_scale is not None:
+                smoothquant_applied += 1
         except Exception as e:
             print(f"  [FakeQuant] Failed to convert {full_name}: {e}")
             fallback += 1
@@ -607,6 +965,11 @@ def convert_model_to_fakequant(
     if missing_act_stats:
         preview = ", ".join(missing_act_stats[:8])
         suffix = "..." if len(missing_act_stats) > 8 else ""
+        if activation_qdq_mode in DRAQ_STATIC_MODES:
+            raise RuntimeError(
+                f"A8 FakeQuant mode {activation_qdq_mode} requires DRAQ static calibration "
+                f"for every Linear layer; missing {len(missing_act_stats)} layer(s): {preview}{suffix}"
+            )
         raise RuntimeError(
             f"A8 FakeQuant requires calibrated asymmetric activation stats for every "
             f"Linear layer; missing {len(missing_act_stats)} layer(s): {preview}{suffix}"
@@ -621,11 +984,14 @@ def convert_model_to_fakequant(
         "static_quality_policy": static_quality_policy,
         "activation_qdq_mode": activation_qdq_mode,
         "enable_bias_correction": enable_bias_correction,
+        "smoothquant_applied": smoothquant_applied,
+        "weight_rounding": weight_rounding,
     }
     print(
         f"[FakeQuant] {mode}: {converted} converted, {fallback} fallback (unchanged), "
         f"fp16_skip={skipped_fp16}, act_q_disabled={act_disabled}, "
         f"static_quality_policy={static_quality_policy}, activation_qdq_mode={activation_qdq_mode}, "
+        f"smoothquant_applied={smoothquant_applied}, weight_rounding={weight_rounding}, "
         f"mode_counts={mode_counts}"
     )
     model._fakequant_conversion_summary = summary

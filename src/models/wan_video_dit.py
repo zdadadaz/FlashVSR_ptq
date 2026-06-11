@@ -540,7 +540,7 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        self_attn_output, _, _ = self.self_attn(
+        self_attn_output, last_pre_cache_k, last_pre_cache_v = self.self_attn(
             input_x, freqs, f, h, w, local_num, topk, train_img, block_id,
             kv_len=kv_len, is_full_block=is_full_block, is_stream=is_stream,
             pre_cache_k=pre_cache_k, pre_cache_v=pre_cache_v, local_range = local_range)
@@ -551,7 +551,7 @@ class DiTBlock(nn.Module):
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         if is_stream:
-            return x, None, None
+            return x, last_pre_cache_k, last_pre_cache_v
         return x
 
 

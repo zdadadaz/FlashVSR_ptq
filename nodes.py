@@ -896,7 +896,8 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
         log(f"FakeQuant mode: {fq_mode}", message_type='info', icon="🔍")
 
         # Load state dict before FakeQuant module construction so mixed W4/W8
-        # checkpoints can infer per-layer modes from tensor shapes.
+        # and static-PTQ FP16-fallback checkpoints can infer per-layer modes
+        # from tensor shapes / key presence.
         if ckpt_path.endswith(".safetensors"):
             from safetensors.torch import load_file
             sd_dit = load_file(ckpt_path)
@@ -909,6 +910,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
                 new_sd[k[6:]] = v
             else:
                 new_sd[k] = v
+
         is_lsgquant_qao_ckpt = any(k.endswith(".residual.weight_int") for k in new_sd)
         if is_lsgquant_qao_ckpt:
             inferred_policy = infer_lsgquant_layer_policy_from_state_dict(
@@ -928,8 +930,19 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
                 dit, new_sd, default_activation_qdq_mode="draq_symmetric"
             )
             if inferred_policy:
-                log(f"Inferred FakeQuant per-layer policy from checkpoint: {len(inferred_policy)} layers", message_type='info', icon="🧩")
-                convert_model_to_fakequant(dit, mode=fq_mode, act_stats=None, layer_policy=inferred_policy, activation_qdq_mode="draq_symmetric")
+                fp16_skips = sum(1 for entry in inferred_policy.values() if entry.get("mode") == "fp16_skip")
+                log(
+                    f"Inferred FakeQuant per-layer policy from checkpoint: {len(inferred_policy)} layers"
+                    + (f" ({fp16_skips} FP16 fallback)" if fp16_skips else ""),
+                    message_type='info', icon="🧩",
+                )
+                convert_model_to_fakequant(
+                    dit,
+                    mode=fq_mode,
+                    act_stats=None,
+                    layer_policy=inferred_policy,
+                    activation_qdq_mode="draq_symmetric",
+                )
             else:
                 convert_model_to_fakequant(dit, mode=fq_mode, act_stats=None)
         dit.load_state_dict(new_sd, strict=False)
@@ -977,7 +990,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", quantize_mode=
         # Load LQ_proj_in
         if model == "FlashVSR":
             fq_pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
-        else:
+        else: # FlashVSR-v1.1
             fq_pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
         fq_pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu", weights_only=False), strict=True)
         fq_pipe.denoising_model().LQ_proj_in.to(device)
@@ -1546,26 +1559,24 @@ def flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_
     # (Currently just logs warnings - user can adjust settings manually)
     
     # ==========================================================================
-    # FIX 4: Lossless Resize Factor
-    # Use NEAREST interpolation for integer-like factors, BICUBIC otherwise
+    # Resize Factor
+    # Always use BICUBIC for downsampling before FlashVSR. NEAREST caused visible
+    # block artifacts for 0.25x inputs.
     # ==========================================================================
     if resize_factor < 1.0 and resize_factor > 0:
         log(f"Resizing input by factor {resize_factor}...", message_type='info', icon="📉")
         orig_H, orig_W = frames.shape[1], frames.shape[2]
         new_H, new_W = int(orig_H * resize_factor), int(orig_W * resize_factor)
         
-        # Check if resize factor results in integer scaling (lossless possible)
-        is_integer_scale = (orig_H % new_H == 0 and orig_W % new_W == 0) or (resize_factor in [0.5, 0.25, 0.125])
-        
         frames_permuted = frames.permute(0, 3, 1, 2)
-        if is_integer_scale:
-            # Use NEAREST for potentially lossless integer downscaling
-            frames_resized = F.interpolate(frames_permuted, size=(new_H, new_W), mode='nearest')
-            log(f"Using NEAREST interpolation (lossless for {resize_factor}x)", message_type='info', icon="🔍")
-        else:
-            # Use BICUBIC for non-integer factors
-            frames_resized = F.interpolate(frames_permuted, size=(new_H, new_W), mode='bicubic', align_corners=False)
-            log(f"Using BICUBIC interpolation for non-integer scaling", message_type='info', icon="🔍")
+        frames_resized = F.interpolate(
+            frames_permuted,
+            size=(new_H, new_W),
+            mode='bicubic',
+            align_corners=False,
+            antialias=True,
+        )
+        log(f"Using BICUBIC interpolation with antialias=True for resize_factor={resize_factor}", message_type='info', icon="🔍")
         
         frames = frames_resized.permute(0, 2, 3, 1)  # Back to NHWC
         del frames_permuted, frames_resized

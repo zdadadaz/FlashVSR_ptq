@@ -175,6 +175,69 @@ def build_smoothquant_cache(
     return out
 
 
+
+def load_les_cache(path: str | Path) -> dict[str, Any]:
+    """Load Learned Equivalent Scaling tau cache as SmoothQuant-compatible scales.
+
+    Accepted entry shapes:
+      {"layer": {"tau": [...]}}
+      {"layer": {"smoothquant_scale": [...]}}
+      {"layer": [...]}
+    Returns a JSON-serializable SmoothQuant cache so fakequant_convert.py can reuse
+    the existing --smoothquant_cache path without runtime changes.
+    """
+    raw = load_json(path)
+    out: dict[str, Any] = {
+        "_metadata": {
+            "schema_version": "flashvsr.smoothquant_cache.v1",
+            "source_schema": raw.get("_metadata", {}).get("schema_version", "flashvsr.learned_equivalent_scaling.v1"),
+            "source": str(path),
+            "scale_semantics": "LES tau loaded through SmoothQuant-compatible buffer",
+        }
+    }
+    for name, entry in raw.items():
+        if name.startswith("_"):
+            continue
+        value = entry
+        if isinstance(entry, dict):
+            value = entry.get("tau", entry.get("smoothquant_scale", entry.get("scale")))
+        if value is None:
+            continue
+        out[name] = {"smoothquant_scale": [float(x) for x in _flatten_floats(value)]}
+    return out
+
+
+def select_ptq_policy_and_scales(
+    model: nn.Module,
+    layer_names: list[str],
+    calibration: dict[str, Any],
+    fallback_ratio: float,
+    smoothquant_alpha: float,
+    sensitivity_cache: str | None = None,
+    les_cache: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Select policy/scales for static baseline, true-sensitivity E, or LES B.
+
+    E: --sensitivity_cache overrides the old heuristic with measured MSE ranking
+    and uses dynamic_asymmetric for non-skipped layers as requested by the daily
+    master schedule. B: --les_cache supplies learned tau through the existing
+    SmoothQuant scale buffer.
+    """
+    if sensitivity_cache:
+        from scripts.ptq.build_true_sensitive_policy import build_true_sensitive_policy, load_sensitivity_cache
+
+        policy = build_true_sensitive_policy(
+            load_sensitivity_cache(sensitivity_cache),
+            fp16_skip_ratio=fallback_ratio,
+            robust_mode="a8w8",
+            robust_activation_qdq_mode="dynamic_asymmetric",
+        )
+    else:
+        policy = build_static_mixed_policy(layer_names, calibration, fallback_ratio)
+
+    smoothquant_cache = load_les_cache(les_cache) if les_cache else build_smoothquant_cache(model, calibration, alpha=smoothquant_alpha)
+    return policy, smoothquant_cache
+
 def run_cmd(cmd: Iterable[str], dry_run: bool) -> None:
     printable = " ".join(str(x) for x in cmd)
     print(f"$ {printable}")
@@ -189,13 +252,15 @@ def main() -> None:
     parser.add_argument("--out_dir", default="outputs/static_ptq_baseline")
     parser.add_argument("--fallback_ratio", type=float, default=0.15, help="Sensitive FP16 fallback ratio; use 0.10-0.20")
     parser.add_argument("--smoothquant_alpha", type=float, default=0.5)
+    parser.add_argument("--sensitivity_cache", type=str, default=None, help="Build policy from true per-layer sensitivity cache (Direction E)")
+    parser.add_argument("--les_cache", type=str, default=None, help="Use Learned Equivalent Scaling tau cache as SmoothQuant-compatible scales (Direction B)")
     parser.add_argument("--fp16_video", default="", help="Optional already-rendered FP16 output video")
     parser.add_argument("--ptq_video", default="", help="Optional already-rendered PTQ output video")
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
 
-    if not 0.10 <= args.fallback_ratio <= 0.20:
-        raise ValueError("For this baseline use --fallback_ratio between 0.10 and 0.20")
+    if not 0.05 <= args.fallback_ratio <= 0.40:
+        raise ValueError("Use --fallback_ratio between 0.05 and 0.40 for heuristic/true-sensitivity fallback")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -206,11 +271,18 @@ def main() -> None:
         model = load_checkpoint(args.checkpoint, model)
     layer_names = layer_names_from_model(model)
 
-    policy = build_static_mixed_policy(layer_names, calibration, args.fallback_ratio)
+    policy, smoothquant_cache = select_ptq_policy_and_scales(
+        model=model,
+        layer_names=layer_names,
+        calibration=calibration,
+        fallback_ratio=args.fallback_ratio,
+        smoothquant_alpha=args.smoothquant_alpha,
+        sensitivity_cache=args.sensitivity_cache,
+        les_cache=args.les_cache,
+    )
     policy_path = out_dir / "static_mixed_fp16fallback_policy.json"
     policy_path.write_text(json.dumps(policy, indent=2))
 
-    smoothquant_cache = build_smoothquant_cache(model, calibration, alpha=args.smoothquant_alpha)
     smoothquant_path = out_dir / "smoothquant_scales.json"
     smoothquant_path.write_text(json.dumps(smoothquant_cache, indent=2))
 
@@ -246,6 +318,8 @@ def main() -> None:
         "output_checkpoint": str(ckpt_out),
         "fallback_ratio": args.fallback_ratio,
         "smoothquant_alpha": args.smoothquant_alpha,
+        "sensitivity_cache": args.sensitivity_cache,
+        "les_cache": args.les_cache,
         "weight_rounding": "adaround",
         "convert_cmd": convert_cmd,
         "psnr_json": str(psnr_json) if psnr_json else None,

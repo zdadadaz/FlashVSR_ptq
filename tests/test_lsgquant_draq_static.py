@@ -14,6 +14,7 @@ from src.models.quantization.fakequant import (
     convert_model_to_fakequant,
 )
 from scripts.ptq.fakequant_convert import load_calibration_cache
+from scripts.ptq.fakequant_calibrate import build_lsgquant_calibration_cache
 
 
 def _identity_fq(mode: str, in_features: int = 4) -> FakeQuantLinear:
@@ -129,6 +130,29 @@ def test_build_draq_static_cache_entry_collects_percentiles_and_volts_tier():
     assert len(entry["draq_s_absmax"]) == 3
     assert "draq_d_by_bucket" in entry
     assert set(entry["draq_d_by_bucket"]) == {"first", "last"}
+
+
+def test_calibration_cache_serializes_draq_static_fields_from_act_min_max():
+    act_stats = {
+        "layer": {
+            "act_scale": torch.tensor([0.1, 0.2]),
+            "zero_point": torch.tensor([0, -1]),
+            "act_min": torch.tensor([-1.0, -4.0]),
+            "act_max": torch.tensor([2.0, 3.0]),
+            "act_mean": torch.tensor([0.25, -0.5]),
+            "mu_samples_mean": torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
+        }
+    }
+    cache = build_lsgquant_calibration_cache(act_stats, metadata={"mode": "a8w8"})
+    entry = cache["layer"]
+    assert entry["draq_s_absmax"] == [2.0, 4.0]
+    assert entry["draq_s_percentile_99"] == [2.0, 4.0]
+    assert entry["draq_s_percentile_999"] == [2.0, 4.0]
+    assert entry["draq_d_absmax"] == 1.0
+    assert entry["draq_d_percentile_99"] == 1.0
+    assert entry["draq_d_percentile_999"] == 1.0
+    assert entry["draq_d_by_bucket"] == {"all": 1.0}
+    assert "volts_tier" in entry
 
 
 def test_load_calibration_cache_preserves_static_draq_fields(tmp_path):

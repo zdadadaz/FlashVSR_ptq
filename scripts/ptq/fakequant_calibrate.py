@@ -311,6 +311,33 @@ def build_lsgquant_calibration_cache(act_stats: dict | None, metadata: dict) -> 
             entry["mu_var"] = _compute_mu_var(mu_samples)
         else:
             entry["mu_var"] = 0.0
+
+        # Static-DRAQ calibration fields. The GPU calibrator keeps per-forward
+        # min/max summaries instead of full activation samples to avoid retaining
+        # huge WanModel tensors. Use the conservative per-channel absolute range
+        # as the fixed static s_i; normalized activations are then bounded by
+        # d=1 for layer/bucket static modes, while draq_static_s still computes
+        # token d_j dynamically at runtime.
+        if "act_min" in s and "act_max" in s:
+            act_min = torch.as_tensor(s["act_min"]).float()
+            act_max = torch.as_tensor(s["act_max"]).float()
+            draq_s = torch.maximum(act_min.abs(), act_max.abs()).clamp(min=1e-6)
+            entry.update({
+                "draq_s_absmax": _tensor_to_json_list(draq_s),
+                "draq_s_percentile_99": _tensor_to_json_list(draq_s),
+                "draq_s_percentile_999": _tensor_to_json_list(draq_s),
+                "draq_d_absmax": 1.0,
+                "draq_d_percentile_99": 1.0,
+                "draq_d_percentile_999": 1.0,
+                "draq_d_by_bucket": {"all": 1.0},
+            })
+            mu_var = float(entry.get("mu_var", 0.0) or 0.0)
+            if mu_var < 0.001:
+                entry["volts_tier"] = "frozen"
+            elif mu_var < 0.075:
+                entry["volts_tier"] = "light"
+            else:
+                entry["volts_tier"] = "full"
         cache[name] = entry
     return cache
 

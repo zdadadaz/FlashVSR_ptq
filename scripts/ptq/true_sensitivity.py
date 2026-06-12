@@ -162,8 +162,8 @@ def measure_sensitivity(
     from src.models.wan_video_dit import sinusoidal_embedding_1d
     # Cast t_big to model dtype to avoid Linear dtype mismatch
     model_dtype = next(model.parameters()).dtype
-    t_big = torch.randint(0, 1000, (1,), device=device, dtype=model_dtype)
-    t_emb = model.time_embedding(sinusoidal_embedding_1d(model.freq_dim, t_big.float()).to(model_dtype))
+    t_big_int = torch.randint(0, 1000, (1,), device=device, dtype=torch.long)
+    t_emb = model.time_embedding(sinusoidal_embedding_1d(model.freq_dim, t_big_int.float()).to(model_dtype))
     t_mod_for_fwd = model.time_projection(t_emb).unflatten(1, (6, model.dim))
 
     # Manual block-level forward (per fakequant_calibrate.py:1169-1216)
@@ -184,7 +184,8 @@ def measure_sensitivity(
         if x_4d.dim() == 5:
             x_5d = x_4d
         else:
-            x_5d = x_4d.unsqueeze(2).cuda()  # (1, C, 1, H, W)
+            x_5d = x_4d.unsqueeze(2)  # (1, C, 1, H, W)
+        x_5d = x_5d.to(device=device, dtype=model_dtype)
         _, _, D_pad, H_pad, W_pad = x_5d.shape
         pad_f = (req_f - D_pad % req_f) % req_f
         pad_h = (req_h - H_pad % req_h) % req_h

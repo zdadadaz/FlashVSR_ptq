@@ -53,6 +53,13 @@ def test_static_baseline_can_select_true_sensitivity_and_les_caches(tmp_path):
     assert scales["0"]["smoothquant_scale"] == [1.0, 2.0, 3.0, 4.0]
 
 
+def test_true_sensitivity_casts_latents_to_model_dtype_before_patchify():
+    source = open("scripts/ptq/true_sensitivity.py", encoding="utf-8").read()
+
+    assert "t_big_int = torch.randint" in source
+    assert "x_5d = x_5d.to(device=device, dtype=model_dtype)" in source
+
+
 def test_les_optimizer_reduces_layer_reconstruction_loss():
     from scripts.ptq.learned_equivalent_scaling import optimize_layer_tau
 

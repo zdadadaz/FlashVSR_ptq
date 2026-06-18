@@ -55,6 +55,7 @@ def build_convert_command(
         "--mode", "a8w8",
         "--activation_qdq_mode", activation_qdq_mode,
         "--policy", str(policy),
+        "--static_clipping", clipping,
         "--output_scale_multiplier", str(output_scale_multiplier),
     ]
     if enable_bias_correction:

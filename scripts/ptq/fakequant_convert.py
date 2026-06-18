@@ -155,33 +155,67 @@ def load_output_calibration_cache(act_stats: dict, device: str = "cuda") -> dict
     return out
 
 
-def recompute_symmetric_act_scales(act_stats: dict) -> dict:
-    """Recompute per-channel symmetric int8 act_scale from act_min/act_max.
+def _estimate_static_qdq_mse(bound: torch.Tensor, absmax: torch.Tensor) -> torch.Tensor:
+    """Cheap per-channel MSE proxy for choosing a static symmetric clip bound.
 
-    The calibration cache stores asymmetric per-channel scale + zero_point
-    (`act_scale = (max-min)/255`, `zero_point = -min/scale`). For
-    ``activation_qdq_mode=static_tensor_symmetric`` (mode 7) we need a
-    symmetric per-channel scale with zero_point=0:
+    Calibration caches store min/max and DRAQ percentile scales, not raw samples.
+    This proxy models quantization error inside the clip range plus a clipped-tail
+    penalty for channels whose absmax exceeds the candidate bound. It is only used
+    to rank candidate bounds from the same calibration entry.
+    """
 
-        sym_scale = max(|act_min|, |act_max|) / 127
+    bound = bound.float().clamp(min=1e-6)
+    absmax = absmax.float().clamp(min=1e-6)
+    step_mse = (bound / 127.0).pow(2) / 12.0
+    tail = torch.relu(absmax - bound)
+    tail_mse = tail.pow(2) * 1e-5
+    return step_mse + tail_mse
 
-    Returns a NEW dict in the same shape as ``act_stats`` with `act_scale`
-    and `zero_point` overridden, leaving `act_min`/`act_max` etc. intact for
-    debugging.
+
+def _select_static_clip_bound(s: dict, clipping: str) -> torch.Tensor:
+    act_min = s["act_min"].float()
+    act_max = s["act_max"].float()
+    absmax = torch.maximum(act_min.abs(), act_max.abs()).clamp(min=1e-6)
+    if clipping == "minmax":
+        return absmax
+    if clipping == "percentile_99":
+        return s.get("draq_s_percentile_99", absmax).float().clamp(min=1e-6)
+    if clipping == "percentile_999":
+        return s.get("draq_s_percentile_999", absmax).float().clamp(min=1e-6)
+    if clipping == "mse":
+        candidates = [absmax]
+        for key in ("draq_s_percentile_99", "draq_s_percentile_999"):
+            if key in s:
+                candidate = s[key].float().clamp(min=1e-6)
+                ratio = absmax / candidate
+                candidate = torch.where((candidate < absmax * 0.8) & (ratio <= 2.0), absmax, candidate)
+                candidates.append(candidate)
+        stacked = torch.stack(candidates, dim=0)
+        scores = torch.stack([_estimate_static_qdq_mse(candidate, absmax) for candidate in candidates], dim=0)
+        best = torch.argmin(scores, dim=0)
+        return torch.gather(stacked, 0, best.unsqueeze(0)).squeeze(0)
+    raise ValueError(f"Unsupported static clipping policy: {clipping}")
+
+
+def recompute_symmetric_act_scales(act_stats: dict, clipping: str = "minmax") -> dict:
+    """Recompute per-channel symmetric int8 act_scale from cache statistics.
+
+    ``clipping`` controls the static activation bound used by mode 7:
+    ``minmax`` uses max(|min|, |max|), percentile modes use cached DRAQ
+    percentile per-channel bounds when available, and ``mse`` selects among
+    minmax/p99/p99.9 with a deterministic cache-only error proxy.
     """
     out = {}
     for name, s in act_stats.items():
         if "act_min" not in s or "act_max" not in s:
             out[name] = s
             continue
-        act_min = s["act_min"]
-        act_max = s["act_max"]
-        # Move to cpu to compute (avoid device-specific shape quirks)
-        sym_scale = torch.maximum(act_min.abs(), act_max.abs()) / 127.0
-        sym_scale = sym_scale.clamp(min=1e-6)
+        sym_bound = _select_static_clip_bound(s, clipping)
+        sym_scale = (sym_bound / 127.0).clamp(min=1e-6)
         s_new = dict(s)
         s_new["act_scale"] = sym_scale.to(s["act_scale"].device, s["act_scale"].dtype)
         s_new["zero_point"] = torch.zeros_like(s["zero_point"])
+        s_new["static_clipping"] = clipping
         out[name] = s_new
     return out
 
@@ -393,6 +427,11 @@ def main():
              "diffusion PSNR without learned scaling."
     )
     parser.add_argument(
+        "--static_clipping", type=str, default="minmax",
+        choices=["minmax", "percentile_99", "percentile_999", "mse"],
+        help="Static tensor symmetric activation clipping: min/max, cached DRAQ percentiles, or cache-only MSE proxy selection."
+    )
+    parser.add_argument(
         "--output_scale_multiplier", type=float, default=1.5,
         help="Per-output-channel safety multiplier for static output QDQ (mode 7). "
              "FlashVSR DiT has heavy per-channel outliers not fully captured by short "
@@ -446,7 +485,7 @@ def main():
         # The cache stores asymmetric per-channel scale + zero_point; symmetric
         # mode 7 requires zero_point=0, so reusing the asymmetric scale here
         # causes severe clamping (verified: produced 12.7 dB on bowing_cif).
-        act_stats = recompute_symmetric_act_scales(act_stats)
+        act_stats = recompute_symmetric_act_scales(act_stats, clipping=args.static_clipping)
         output_stats = load_output_calibration_cache(act_stats)
         # Apply safety multiplier to widen the per-output-channel bound.
         # Calibration with 8-32 samples doesn't capture full inter-timestep
@@ -512,6 +551,7 @@ def main():
         "draq_qrange": args.draq_qrange,
         "smoothquant_cache": args.smoothquant_cache or None,
         "weight_rounding": args.weight_rounding,
+        "static_clipping": args.static_clipping,
     })
     summary_path = f"{args.output}.conversion_summary.json"
     with open(summary_path, "w") as f:

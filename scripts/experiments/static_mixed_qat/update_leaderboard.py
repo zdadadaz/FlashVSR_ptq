@@ -38,6 +38,12 @@ def _read_psnr_mean(path: str | Path | None) -> float | None:
         for key in ("average_psnr", "mean_psnr", "psnr_mean", "psnr_avg_db"):
             if key in data["summary"]:
                 return float(data["summary"][key])
+    if isinstance(data.get("last_metrics"), dict):
+        # QAT smoke summaries do not run video eval; use teacher/student latent
+        # PSNR as a consistency metric and make that distinction in eval_set/notes.
+        for key in ("teacher_psnr_db", "psnr_avg_db", "mean_psnr"):
+            if key in data["last_metrics"]:
+                return float(data["last_metrics"][key])
     return None
 
 

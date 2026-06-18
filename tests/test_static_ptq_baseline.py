@@ -49,6 +49,7 @@ def test_fakequant_linear_smoothquant_buffers_and_forward_run():
         act_scale=torch.ones(4) * 0.1,
         act_zero_point=torch.zeros(4, dtype=torch.int32),
         smoothquant_scale=sq,
+        enable_smoothquant=True,  # opt-in flag
         weight_rounding="adaround",
         act_mean=torch.ones(4),
     )
@@ -58,6 +59,22 @@ def test_fakequant_linear_smoothquant_buffers_and_forward_run():
     assert fq.weight_int.dtype == torch.int8
     y = fq(torch.randn(2, 5, 4))
     assert y.shape == (2, 5, 3)
+
+
+def test_fakequant_linear_smoothquant_off_by_default():
+    """SmoothQuant must be off when enable_smoothquant=False (DMQ ICCV'25 default)."""
+    layer = nn.Linear(4, 3)
+    sq = torch.tensor([0.5, 1.0, 2.0, 4.0])
+    fq = FakeQuantLinear.from_float(
+        layer,
+        activation_mode="a8",
+        weight_mode="w8",
+        act_scale=torch.ones(4) * 0.1,
+        act_zero_point=torch.zeros(4, dtype=torch.int32),
+        smoothquant_scale=sq,  # supplied but...
+        enable_smoothquant=False,  # ...NOT applied
+    )
+    assert not bool(fq.smoothquant_enabled.item())
 
 
 def test_convert_model_accepts_smoothquant_scales_and_adaround():
@@ -70,6 +87,7 @@ def test_convert_model_accepts_smoothquant_scales_and_adaround():
         mode="a8w8",
         act_stats=stats,
         smoothquant_scales=sq,
+        enable_smoothquant=True,  # opt-in
         weight_rounding="adaround",
     )
 
@@ -77,6 +95,24 @@ def test_convert_model_accepts_smoothquant_scales_and_adaround():
     assert bool(model.text_embedding[0].smoothquant_enabled.item())
     assert model._fakequant_conversion_summary["smoothquant_applied"] == len(sq)
     assert model._fakequant_conversion_summary["weight_rounding"] == "adaround"
+
+
+def test_convert_model_smoothquant_off_by_default():
+    """convert_model_to_fakequant must NOT apply SmoothQuant unless enable_smoothquant=True."""
+    model = TinySQModel()
+    stats = _stats_for(model)
+    sq = {name: torch.ones(module.in_features) for name, module in model.named_modules() if isinstance(module, nn.Linear)}
+
+    convert_model_to_fakequant(
+        model,
+        mode="a8w8",
+        act_stats=stats,
+        smoothquant_scales=sq,
+        # enable_smoothquant omitted → False
+    )
+
+    assert isinstance(model.text_embedding[0], FakeQuantLinear)
+    assert not bool(model.text_embedding[0].smoothquant_enabled.item())
 
 
 def test_mixed_checkpoint_fp16_skip_policy_reloads_without_quantizing_skipped_layers():

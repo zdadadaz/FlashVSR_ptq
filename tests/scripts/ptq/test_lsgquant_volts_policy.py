@@ -27,8 +27,10 @@ def test_calibration_cache_serializes_lsgquant_volts_statistics():
         metadata={"mode": "a8w8", "num_samples": 2, "num_videos": 50},
     )
 
-    assert cache["_metadata"]["schema_version"] == "flashvsr.lsgquant.calibration.v1"
+    assert cache["_metadata"]["schema_version"] == "flashvsr.lsgquant.calibration.v2"
     assert "mu_mean" in cache["_metadata"]["stats"]
+    assert "output_scale" in cache["_metadata"]["stats"]
+    assert "output_zero_point" in cache["_metadata"]["stats"]
     assert cache["blocks.0.self_attn.q"]["act_min"] == [-1.0, -0.5]
     assert cache["blocks.0.self_attn.q"]["mu_samples_mean"] == [[0.10000000149011612, 0.20000000298023224], [0.20000000298023224, 0.4000000059604645]]
     assert abs(cache["blocks.0.self_attn.q"]["mu_var"] - 0.0125) < 1e-7

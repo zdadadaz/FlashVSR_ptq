@@ -23,6 +23,7 @@ ACTIVATION_QDQ_MODE_TO_ID = {
     "draq_static_s": 4,
     "draq_static_sd_layer": 5,
     "draq_static_sd_bucket": 6,
+    "static_tensor_symmetric": 7,  # per-tensor/per-channel symmetric, output_qdq enabled
 }
 
 DRAQ_STATIC_MODES = {"draq_static_s", "draq_static_sd_layer", "draq_static_sd_bucket"}
@@ -34,6 +35,38 @@ def _to_tensor(value, *, device=None, dtype=torch.float32):
     if isinstance(value, torch.Tensor):
         return value.detach().to(device=device, dtype=dtype)
     return torch.tensor(value, device=device, dtype=dtype)
+
+
+def _qdq_symmetric_channel(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    qmin: int = -127,
+    qmax: int = 127,
+    enabled: bool = True,
+    axis: int = -1,
+) -> torch.Tensor:
+    """Quantize-dequantize a tensor along ``axis`` using per-channel symmetric qparams.
+
+    Mirrors the QDQLinear helper from FlashVSR_PTQ so we get parity for
+    per-output-channel symmetric int8 (matches ``output_axis=-1``).
+    """
+    if not enabled or scale is None:
+        return x
+    scale = scale.to(device=x.device, dtype=torch.float32).clamp(min=1e-8)
+    if scale.ndim == 0 or scale.numel() == 1 or axis is None:
+        # per-tensor path
+        q = torch.clamp(torch.round(x.to(torch.float32) / scale), qmin, qmax).to(torch.int8)
+        return (q.to(torch.float32) * scale).to(x.dtype)
+    if zero_point is None:
+        zero_point = torch.zeros_like(scale)
+    axis = axis if axis >= 0 else x.ndim + axis
+    shape = [1] * x.ndim
+    shape[axis] = scale.numel()
+    s = scale.reshape(shape)
+    zp = zero_point.to(device=x.device, dtype=torch.float32).reshape(shape)
+    q = torch.clamp(torch.round(x.to(torch.float32) / s + zp), qmin, qmax).to(torch.int8)
+    return ((q.to(torch.float32) - zp) * s).to(x.dtype)
 
 
 def _tensor_percentile(values: torch.Tensor, q: float) -> torch.Tensor:
@@ -268,6 +301,20 @@ class FakeQuantLinear(nn.Module):
             self.register_buffer("act_scale", None)
             self.register_buffer("act_zero_point", None)
 
+        # ---- Output per-channel scale / zero-point (per-output-channel symmetric) ----
+        # Used by mode-7 (static_tensor_symmetric) and any mode that opts into
+        # output-side QDQ. Per-output-channel symmetric int8 — shape mirrors the
+        # weight buffer so the calibration hook in fakequant_calibrate can fill it
+        # directly from forward-hook amax statistics.
+        self.register_buffer(
+            "output_scale",
+            torch.ones(out_features, 1, dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "output_zero_point",
+            torch.zeros(out_features, 1, dtype=torch.int32, device=device),
+        )
+
         # ---- Bias ----
         if bias:
             self.register_buffer(
@@ -313,6 +360,26 @@ class FakeQuantLinear(nn.Module):
                 x_scale = torch.amax(torch.abs(x_float), dim=-1, keepdim=True).clamp(min=1e-6) / 127.0
                 x_q = torch.clamp(torch.round(x_float / x_scale), -127, 127).to(torch.int8)
                 x_fp = x_q.to(torch.float32) * x_scale
+            elif qdq_mode == 7:
+                # Static calibrated symmetric signed-int8 activation QDQ.
+                # Two supported layouts:
+                #  - per-input-channel: act_scale shape [1, 1, in_features]
+                #  - per-tensor (scalar): act_scale has 1 element; broadcast
+                #    across the entire tensor (matches FlashVSR_PTQ per-tensor
+                #    contract; robust against inter-timestep dynamic range).
+                act_scale_data = self.act_scale.to(device=x.device, dtype=torch.float32)
+                if act_scale_data.numel() == 1:
+                    # Per-tensor symmetric: one scalar for the whole tensor.
+                    x_scale = act_scale_data.reshape(()).clamp(min=1e-6)
+                    x_q = torch.clamp(torch.round(x_float / x_scale), -127, 127).to(torch.int8)
+                    x_fp = x_q.to(torch.float32) * x_scale
+                else:
+                    # Per-input-channel symmetric (default layout).
+                    x_scale = act_scale_data.reshape(
+                        *([1] * (x.dim() - 1)), self.in_features
+                    ).clamp(min=1e-6)
+                    x_q = torch.clamp(torch.round(x_float / x_scale), -127, 127).to(torch.int8)
+                    x_fp = x_q.to(torch.float32) * x_scale
             elif qdq_mode == 2:
                 # Dynamic per-token asymmetric signed-int8 activation QDQ.
                 qmin, qmax = -128.0, 127.0
@@ -375,6 +442,27 @@ class FakeQuantLinear(nn.Module):
         # if weight_scale was not properly initialized (e.g., act_stats=None path).
         y = F.linear(x_fp.to(torch.float32), w_fp.to(torch.float32), self.bias.to(torch.float32) if self.bias is not None else None)
 
+        # ---- (3.5) Output-side QDQ (per-output-channel symmetric int8) ----
+        # Only when activation is being quantized (a8/a4, act_quant_enabled=True)
+        # AND we have calibrated output_scale values. Mode 7 (static_tensor_symmetric)
+        # is the primary use case; this also runs for any a8 mode that fills
+        # `output_scale` from the calibration hook, giving us parity with the
+        # QDQLinear contract in FlashVSR_PTQ.
+        qdq_mode = int(self.activation_qdq_mode.item())
+        if (
+            (activation_is_a8 or activation_is_a4)
+            and bool(self.act_quant_enabled.item())
+            and qdq_mode == 7  # static_tensor_symmetric is the contract that requires output QDQ
+        ):
+            y = _qdq_symmetric_channel(
+                y,
+                scale=self.output_scale.reshape(-1),
+                zero_point=self.output_zero_point.reshape(-1).to(torch.float32),
+                qmin=-127, qmax=127,
+                enabled=True,
+                axis=-1,
+            )
+
         # ---- (4) Restore original dtype ----
         return y.to(orig_dtype)
 
@@ -422,6 +510,7 @@ class FakeQuantLinear(nn.Module):
         act_quant_enabled: bool = True,
         activation_qdq_mode: str = "static_asymmetric",
         smoothquant_scale: torch.Tensor = None,
+        enable_smoothquant: bool = False,
         draq_s: torch.Tensor = None,
         draq_d: torch.Tensor = None,
         draq_d_buckets: torch.Tensor = None,
@@ -429,6 +518,8 @@ class FakeQuantLinear(nn.Module):
         draq_qrange: str = "signed_symmetric",
         weight_rounding: str = "nearest",
         ch_axis: int = -1,   # kept for API compat, unused
+        output_scale: torch.Tensor = None,
+        output_zero_point: torch.Tensor = None,
     ):
         """
         Convert nn.Linear → FakeQuantLinear.
@@ -484,8 +575,12 @@ class FakeQuantLinear(nn.Module):
 
         w = linear_module.weight.data.to(torch.float32)  # [out, in]
         sq = None
-        if smoothquant_scale is not None:
-            sq = smoothquant_scale.reshape(-1).clamp(min=1e-6)
+        # SmoothQuant is now opt-in. Set --enable_smoothquant=True (or pass
+        # smoothquant_scale explicitly) to migrate activation outliers into weight.
+        # Per DMQ (ICCV'25) evidence, hand-crafted SmoothQuant hurts diffusion PSNR
+        # without learned scaling; default off matches FlashVSR_PTQ's default.
+        if smoothquant_scale is not None and enable_smoothquant:
+            sq = smoothquant_scale.reshape(-1).clamp(min=1e-6, max=1e5)
             if sq.numel() != linear_module.in_features:
                 raise ValueError(
                     f"smoothquant_scale has {sq.numel()} values, expected {linear_module.in_features}"
@@ -614,6 +709,35 @@ class FakeQuantLinear(nn.Module):
             new_module.bias.copy_(linear_module.bias.data.float())
             if bias_correction is not None:
                 new_module.bias.add_(bias_correction)
+
+        # ---- Output per-channel scale / zero-point ----
+        # Set from calibration hook (output_stats). Per-output-channel symmetric
+        # int8: scale shape [out_features, 1] (or [out_features]), zero_point shape
+        # matches but is forced to 0 in symmetric mode.
+        if output_scale is not None:
+            out_s_tensor = _as_float_tensor(output_scale)
+            if out_s_tensor is None:
+                out_s_tensor = torch.tensor(output_scale, device=new_module.output_scale.device, dtype=torch.float32)
+            out_s = out_s_tensor.reshape(-1)
+            if out_s.numel() == 1:
+                out_s = out_s.expand(new_module.out_features)
+            if out_s.numel() != new_module.out_features:
+                raise ValueError(
+                    f"output_scale has {out_s.numel()} values, expected {new_module.out_features}"
+                )
+            new_module.output_scale.copy_(out_s.clamp(min=1e-8).reshape(-1, 1))
+        if output_zero_point is not None:
+            out_zp_tensor = _as_int_tensor(output_zero_point)
+            if out_zp_tensor is None:
+                out_zp_tensor = torch.tensor(output_zero_point, device=new_module.output_zero_point.device, dtype=torch.int32)
+            out_zp = out_zp_tensor.reshape(-1)
+            if out_zp.numel() == 1:
+                out_zp = out_zp.expand(new_module.out_features)
+            if out_zp.numel() != new_module.out_features:
+                raise ValueError(
+                    f"output_zero_point has {out_zp.numel()} values, expected {new_module.out_features}"
+                )
+            new_module.output_zero_point.copy_(out_zp.reshape(-1, 1))
 
         return new_module
 
@@ -866,7 +990,9 @@ def convert_model_to_fakequant(
     layer_policy: dict | None = None,
     enable_bias_correction: bool = False,
     smoothquant_scales: dict | None = None,
+    enable_smoothquant: bool = False,
     weight_rounding: str = "nearest",
+    output_stats: dict | None = None,
 ):
     """Recursively replace nn.Linear → FakeQuantLinear.
 
@@ -1020,6 +1146,18 @@ def convert_model_to_fakequant(
 
         try:
             disable_act_q = layer_activation_mode in ("a8", "a4") and should_disable_activation_quant(full_name)
+            # Pull per-output-channel output_scale / output_zero_point if available.
+            # Format: {layer_name: {"output_scale": [out_features], "output_zero_point": [out_features]}}
+            out_scale = None
+            out_zp = None
+            if output_stats is not None:
+                out_entry = output_stats.get(full_name) or {}
+                if not out_entry:
+                    leaf = full_name.rsplit(".", 1)[-1] if "." in full_name else full_name
+                    out_entry = output_stats.get(leaf) or {}
+                if out_entry:
+                    out_scale = out_entry.get("output_scale")
+                    out_zp = out_entry.get("output_zero_point")
             new_mod = FakeQuantLinear.from_float(
                 module,
                 activation_mode=layer_activation_mode,
@@ -1030,12 +1168,15 @@ def convert_model_to_fakequant(
                 act_quant_enabled=not disable_act_q,
                 activation_qdq_mode=layer_qdq_mode,
                 smoothquant_scale=smoothquant_scale,
+                enable_smoothquant=enable_smoothquant,
                 draq_s=draq_s,
                 draq_d=draq_d,
                 draq_d_buckets=draq_d_buckets,
                 draq_qrange=draq_qrange,
                 weight_rounding=weight_rounding,
                 ch_axis=ch_axis,
+                output_scale=out_scale,
+                output_zero_point=out_zp,
             )
             parent, leaf_name = get_parent_and_name(model, full_name)
             setattr(parent, leaf_name, new_mod)
@@ -1114,10 +1255,15 @@ def collect_activation_stats_fakequant(
     Run calibration forward passes and collect per-layer activation statistics.
 
     Returns:
-        dict: {layer_name: {'act_scale': tensor [Cin], 'zero_point': tensor [Cin]}}
-        Activation scales use signed-int8 asymmetric quantization:
+        tuple: (act_stats, output_stats)
+            act_stats: {layer_name: {'act_scale': tensor [Cin], 'zero_point': tensor [Cin], ...}}
+            output_stats: {layer_name: {'output_scale': tensor [out_features], 'output_zero_point': tensor [out_features]}}
+        Activation input scales use signed-int8 asymmetric quantization:
             q = clamp(round(x / scale + zero_point), -128, 127)
             x_fp = (q - zero_point) * scale
+        Output scales use per-output-channel symmetric int8:
+            q = clamp(round(y / scale), -127, 127)
+            y_fp = q * scale
 
     Uses register_forward_hook on every nn.Linear — avoids time_embedding
     dtype issues by bypassing it entirely (hooks fire on sub-module forwards).
@@ -1125,6 +1271,7 @@ def collect_activation_stats_fakequant(
     model.eval()
 
     act_stats = {}
+    output_stats = {}
     hooks = []
 
     # ---- Hook factory ----
@@ -1147,6 +1294,16 @@ def collect_activation_stats_fakequant(
             act_stats[name]["sum"].append(act_sum.cpu())
             act_stats[name]["count"].append(reduce_count)
             act_stats[name]["mu"].append((act_sum / max(reduce_count, 1)).squeeze().cpu())
+
+            # Output-side amax (per-output-channel). Same per-channel layout
+            # along the last dim. Used to derive per-output-channel symmetric
+            # int8 scale: output_scale = amax/127, output_zero_point = 0.
+            out = output if not isinstance(output, tuple) else output[0]
+            out = out.detach().float()
+            if name not in output_stats:
+                output_stats[name] = {"amax": []}
+            out_amax = out.abs().amax(dim=tuple(range(out.dim() - 1)), keepdim=False)
+            output_stats[name]["amax"].append(out_amax.cpu())
         return hook_fn
 
     # ---- Register hooks on every Linear ----
@@ -1246,7 +1403,19 @@ def collect_activation_stats_fakequant(
             "act_mean": act_mean.squeeze().float(),
             "mu_samples_mean": torch.stack(stats["mu"], dim=0).float(),
         }
-    return result
+    # ---- Compute per-output-channel output_scale / output_zero_point ----
+    out_result = {}
+    for name, stats in output_stats.items():
+        if not stats["amax"]:
+            continue
+        all_amax = torch.stack(stats["amax"], dim=0).amax(dim=0)  # [out_features]
+        out_scale = (all_amax / 127.0).clamp(min=1e-8)
+        out_zp = torch.zeros_like(out_scale, dtype=torch.int32)
+        out_result[name] = {
+            "output_scale": out_scale.float(),
+            "output_zero_point": out_zp,
+        }
+    return result, out_result
 
 
 def get_all_linear_layers(model) -> list:

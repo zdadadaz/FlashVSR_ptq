@@ -80,6 +80,8 @@ def load_calibration_cache(cache_path: str, device="cuda"):
     Load calibration cache from JSON.
 
     Returns dict: {layer_name: {'act_scale': tensor [Cin], 'zero_point': tensor [Cin]}}
+    Also returns `act_min` / `act_max` so callers can recompute alternative
+    quantization schemes (e.g. symmetric scales for mode 7).
     """
     if not os.path.exists(cache_path):
         return {}
@@ -98,6 +100,14 @@ def load_calibration_cache(cache_path: str, device="cuda"):
             result[name]["zero_point"] = torch.tensor(stats["zero_point"], device=device)
         if "act_mean" in stats:
             result[name]["act_mean"] = torch.tensor(stats["act_mean"], device=device)
+        # Also persist act_min / act_max so we can recompute symmetric scales
+        # for activation_qdq_mode=static_tensor_symmetric (mode 7). The stored
+        # act_scale is the asymmetric per-channel scale; for symmetric int8 we
+        # need scale = max(|act_min|, |act_max|) / 127 with zero_point=0.
+        if "act_min" in stats:
+            result[name]["act_min"] = torch.tensor(stats["act_min"], device=device, dtype=torch.float32)
+        if "act_max" in stats:
+            result[name]["act_max"] = torch.tensor(stats["act_max"], device=device, dtype=torch.float32)
         for key in (
             "draq_s_absmax",
             "draq_s_percentile_99",
@@ -119,7 +129,149 @@ def load_calibration_cache(cache_path: str, device="cuda"):
             result[name]["mu_var"] = stats["mu_var"]
         if "volts_tier" in stats:
             result[name]["volts_tier"] = stats["volts_tier"]
+        # Output QDQ fields (per-output-channel symmetric) used by mode 7
+        # (static_tensor_symmetric). Loaded into a separate dict by
+        # load_output_calibration_cache.
+        if "output_scale" in stats:
+            result[name]["output_scale"] = torch.tensor(stats["output_scale"], device=device, dtype=torch.float32)
+        if "output_zero_point" in stats:
+            result[name]["output_zero_point"] = torch.tensor(stats["output_zero_point"], device=device, dtype=torch.int32)
     return result
+
+
+def load_output_calibration_cache(act_stats: dict, device: str = "cuda") -> dict:
+    """Pull per-layer output_scale / output_zero_point from a loaded calibration cache.
+
+    Returns a dict compatible with FakeQuantLinear.from_float(output_scale=, output_zero_point=)
+    contract: {layer_name: {"output_scale": Tensor[out_features], "output_zero_point": Tensor[out_features]}}.
+    """
+    out = {}
+    for name, stats in act_stats.items():
+        if "output_scale" in stats and "output_zero_point" in stats:
+            out[name] = {
+                "output_scale": stats["output_scale"],
+                "output_zero_point": stats["output_zero_point"],
+            }
+    return out
+
+
+def recompute_symmetric_act_scales(act_stats: dict) -> dict:
+    """Recompute per-channel symmetric int8 act_scale from act_min/act_max.
+
+    The calibration cache stores asymmetric per-channel scale + zero_point
+    (`act_scale = (max-min)/255`, `zero_point = -min/scale`). For
+    ``activation_qdq_mode=static_tensor_symmetric`` (mode 7) we need a
+    symmetric per-channel scale with zero_point=0:
+
+        sym_scale = max(|act_min|, |act_max|) / 127
+
+    Returns a NEW dict in the same shape as ``act_stats`` with `act_scale`
+    and `zero_point` overridden, leaving `act_min`/`act_max` etc. intact for
+    debugging.
+    """
+    out = {}
+    for name, s in act_stats.items():
+        if "act_min" not in s or "act_max" not in s:
+            out[name] = s
+            continue
+        act_min = s["act_min"]
+        act_max = s["act_max"]
+        # Move to cpu to compute (avoid device-specific shape quirks)
+        sym_scale = torch.maximum(act_min.abs(), act_max.abs()) / 127.0
+        sym_scale = sym_scale.clamp(min=1e-6)
+        s_new = dict(s)
+        s_new["act_scale"] = sym_scale.to(s["act_scale"].device, s["act_scale"].dtype)
+        s_new["zero_point"] = torch.zeros_like(s["zero_point"])
+        out[name] = s_new
+    return out
+
+
+def rescale_output_stats(output_stats: dict, act_stats: dict, multiplier: float = 1.5) -> dict:
+    """Widen per-output-channel output_scale by a safety multiplier.
+
+    FlashVSR DiT's per-output-channel distributions have heavy tails that aren't
+    fully captured by short calibration runs (8-32 samples). Without a multiplier
+    the static bound clips up to 30%+ of channels at inference. 1.5x is a
+    conservative default that preserves headroom for inter-timestep dynamic
+    range while keeping int8 effective bits reasonable.
+
+    Only the `output_scale` is scaled (NOT the act_scale) — act_scale is the
+    input-side bound which is naturally tighter; output_scale is the bound
+    applied to F.linear results, where per-channel outliers dominate.
+    """
+    if multiplier == 1.0:
+        return output_stats
+    out = {}
+    for name, entry in output_stats.items():
+        scale = entry["output_scale"]
+        # Ensure fp32
+        scale = (scale.float() * float(multiplier)).clamp(min=1e-8)
+        out[name] = {
+            "output_scale": scale.to(entry["output_scale"].device, entry["output_scale"].dtype),
+            "output_zero_point": entry["output_zero_point"],
+        }
+    return out
+
+
+def collapse_output_stats_to_per_tensor(output_stats: dict) -> dict:
+    """Collapse per-output-channel output_scale to a single per-layer scalar.
+
+    The PTQ project's FlashVSR_PTQ uses per-tensor (scalar) output_scale for
+    robustness against per-channel outliers. This is the contract that
+    produces stable 29.99 dB in their a8w8 static run.
+
+    The collapse rule: per-tensor scale = max(all per-channel scales) / 127
+    with broadcast to scalar — i.e. one value per layer. The forward path
+    treats this as a per-tensor bound (scale.numel() == 1 → no per-channel
+    division in _qdq_symmetric_channel).
+    """
+    out = {}
+    for name, entry in output_stats.items():
+        scale = entry["output_scale"].float()
+        # Take the max across output channels as the per-tensor bound.
+        scalar = scale.amax().clamp(min=1e-8)
+        out[name] = {
+            "output_scale": scalar.reshape(1),  # 1-element tensor → per-tensor
+            "output_zero_point": entry["output_zero_point"][:1].clone() if entry["output_zero_point"].numel() > 1 else entry["output_zero_point"],
+        }
+    return out
+
+
+def collapse_act_stats_to_per_tensor(act_stats: dict) -> dict:
+    """Collapse per-channel act_scale to per-tensor (scalar) for symmetric mode 7.
+
+    Same rationale as collapse_output_stats_to_per_tensor. The cache stores
+    per-channel scales (asymmetric min/max ranges); for symmetric int8 we
+    use the GLOBAL max(|act_min|, |act_max|) / 127 as a single scalar per
+    layer. This is much more robust to outlier channels that aren't fully
+    captured by short calibration.
+
+    Output shape: act_scale with 1 element. The runtime QDQ path in
+    FakeQuantLinear.forward detects numel()==1 and treats it as per-tensor
+    (no per-channel broadcast).
+    """
+    out = {}
+    for name, s in act_stats.items():
+        if "act_min" not in s or "act_max" not in s:
+            out[name] = s
+            continue
+        act_min = s["act_min"].float()
+        act_max = s["act_max"].float()
+        sym_scale = torch.maximum(act_min.abs(), act_max.abs()).amax() / 127.0
+        sym_scale = sym_scale.clamp(min=1e-6)
+        s_new = dict(s)
+        # IMPORTANT: shape must be (1, 1, 1) so numel()==1 in the forward path
+        # and broadcasts to whatever in_features the layer has.
+        if s["act_scale"].dim() == 3:
+            target_shape = (1, 1, 1)
+        elif s["act_scale"].dim() == 1:
+            target_shape = (1,)
+        else:
+            target_shape = (1,) * s["act_scale"].dim()
+        s_new["act_scale"] = sym_scale.to(s["act_scale"].device, s["act_scale"].dtype).reshape(target_shape)
+        s_new["zero_point"] = torch.zeros(target_shape, dtype=s["zero_point"].dtype, device=s["zero_point"].device)
+        out[name] = s_new
+    return out
 
 
 def load_smoothquant_cache(cache_path: str, device="cuda"):
@@ -235,6 +387,18 @@ def main():
         help="Optional JSON containing per-layer SmoothQuant migration scales."
     )
     parser.add_argument(
+        "--enable_smoothquant", action="store_true",
+        help="Opt-in: apply SmoothQuant scale even when --smoothquant_cache is provided. "
+             "Default off — DMQ (ICCV'25) evidence shows hand-crafted SmoothQuant hurts "
+             "diffusion PSNR without learned scaling."
+    )
+    parser.add_argument(
+        "--output_scale_multiplier", type=float, default=1.5,
+        help="Per-output-channel safety multiplier for static output QDQ (mode 7). "
+             "FlashVSR DiT has heavy per-channel outliers not fully captured by short "
+             "calibration. 1.5x is the production-safe default; 1.0 disables."
+    )
+    parser.add_argument(
         "--weight_rounding", type=str, default="nearest", choices=["nearest", "adaround"],
         help="Weight rounding method. 'adaround' uses calibration act_mean for deterministic AdaRound-lite rounding."
     )
@@ -276,6 +440,23 @@ def main():
         smoothquant_scales = load_smoothquant_cache(args.smoothquant_cache)
         print(f"[Convert] Loaded SmoothQuant scales for {len(smoothquant_scales)} layers")
 
+    output_stats = {}
+    if act_stats and args.activation_qdq_mode == "static_tensor_symmetric":
+        # Recompute act_scale as per-channel symmetric: max(|min|, |max|)/127
+        # The cache stores asymmetric per-channel scale + zero_point; symmetric
+        # mode 7 requires zero_point=0, so reusing the asymmetric scale here
+        # causes severe clamping (verified: produced 12.7 dB on bowing_cif).
+        act_stats = recompute_symmetric_act_scales(act_stats)
+        output_stats = load_output_calibration_cache(act_stats)
+        # Apply safety multiplier to widen the per-output-channel bound.
+        # Calibration with 8-32 samples doesn't capture full inter-timestep
+        # dynamic range; without this 30%+ of channels clip at inference.
+        if args.output_scale_multiplier != 1.0:
+            output_stats = rescale_output_stats(output_stats, act_stats, args.output_scale_multiplier)
+            print(f"[Convert] Loaded output QDQ scales for {len(output_stats)} layers (mode=7, symmetric act scale, output_scale × {args.output_scale_multiplier})")
+        else:
+            print(f"[Convert] Loaded output QDQ scales for {len(output_stats)} layers (mode=7, symmetric act scale)")
+
     # ------------------------------------------------------------------
     # 3. Convert nn.Linear → FakeQuantLinear
     # ------------------------------------------------------------------
@@ -290,7 +471,9 @@ def main():
         layer_policy=layer_policy,
         enable_bias_correction=args.enable_bias_correction,
         smoothquant_scales=smoothquant_scales,
+        enable_smoothquant=args.enable_smoothquant,
         weight_rounding=args.weight_rounding,
+        output_stats=output_stats,
     )
 
     # ------------------------------------------------------------------

@@ -44,9 +44,15 @@ def inject_observers(model):
             inject_observers(module)
     return model
 
-def calculate_smoothquant_scales(model, alpha=0.5):
+def calculate_smoothquant_scales(model, alpha=0.5, percentile_clip=0.999, clamp_max=1e5):
     """
     Calculate the smoothing scales based on observed act_amax.
+
+    percentile_clip: clip act_amax to this percentile to prevent outlier channels
+    from dominating the smoothquant scale (per DMQ ICCV'25 evidence). Set to
+    None to disable (legacy behavior).
+    clamp_max: upper bound on the resulting scale to prevent runaway values
+    when act_amax >> weight_amax (also DMQ evidence).
     """
     scales_dict = {}
     for name, module in model.named_modules():
@@ -57,9 +63,14 @@ def calculate_smoothquant_scales(model, alpha=0.5):
             # Ensure same device
             act_amax = act_amax.to(weight_amax.device)
 
+            # Percentile clip to remove outlier-driven blowups.
+            if percentile_clip is not None and act_amax.numel() > 1:
+                clip_val = torch.quantile(act_amax.float(), percentile_clip)
+                act_amax = torch.minimum(act_amax, clip_val)
+
             # SmoothQuant formula: s = act_max^alpha / weight_max^(1-alpha)
             scale = torch.pow(act_amax, alpha) / torch.pow(weight_amax, 1.0 - alpha)
-            scale = torch.clamp(scale, min=1e-5)
+            scale = torch.clamp(scale, min=1e-5, max=clamp_max)
             scales_dict[name] = scale
 
     return scales_dict

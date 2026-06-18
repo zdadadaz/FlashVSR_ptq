@@ -31,11 +31,11 @@ def _read_psnr_mean(path: str | Path | None) -> float | None:
     if not p.exists():
         return None
     data = json.loads(p.read_text())
-    for key in ("average_psnr", "mean_psnr", "psnr_mean", "avg_psnr"):
+    for key in ("average_psnr", "mean_psnr", "psnr_mean", "avg_psnr", "psnr_avg_db"):
         if key in data:
             return float(data[key])
     if isinstance(data.get("summary"), dict):
-        for key in ("average_psnr", "mean_psnr", "psnr_mean"):
+        for key in ("average_psnr", "mean_psnr", "psnr_mean", "psnr_avg_db"):
             if key in data["summary"]:
                 return float(data["summary"][key])
     return None
@@ -97,10 +97,26 @@ def build_leaderboard_row(
 
 
 def write_jsonl_row(path: str | Path, row: dict[str, Any]) -> None:
+    """Upsert a leaderboard row by run_id while preserving JSONL readability."""
+
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a") as f:
-        f.write(json.dumps(row, sort_keys=True) + "\n")
+    rows: list[dict[str, Any]] = []
+    replaced = False
+    if p.exists():
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            existing = json.loads(line)
+            if existing.get("run_id") == row.get("run_id"):
+                rows.append(row)
+                replaced = True
+            else:
+                rows.append(existing)
+    if not replaced:
+        rows.append(row)
+    p.write_text("".join(json.dumps(entry, sort_keys=True) + "\n" for entry in rows))
 
 
 def main() -> None:

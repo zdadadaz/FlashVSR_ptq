@@ -31,13 +31,27 @@ def test_build_leaderboard_row_hashes_policy_and_script(tmp_path):
     assert row["a16_layers"] == 1
 
 
-def test_write_jsonl_and_render_html(tmp_path):
+def test_write_jsonl_upserts_by_run_id_and_render_html(tmp_path):
     path = tmp_path / "leaderboard.jsonl"
     write_jsonl_row(path, {"run_id": "r1", "psnr_vs_fp16_mean": 20.0, "a16_layers": 2})
+    write_jsonl_row(path, {"run_id": "r1", "psnr_vs_fp16_mean": 25.0, "a16_layers": 2})
     write_jsonl_row(path, {"run_id": "r2", "psnr_vs_fp16_mean": 30.0, "a16_layers": 1})
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(rows) == 2
+    assert next(row for row in rows if row["run_id"] == "r1")["psnr_vs_fp16_mean"] == 25.0
 
     html = render_html(path)
 
     assert "r2" in html
     assert "r1" in html
     assert "FlashVSR Static Mixed QAT Leaderboard" in html
+
+
+def test_build_leaderboard_row_reads_compare_video_psnr_schema(tmp_path):
+    psnr = tmp_path / "psnr.json"
+    psnr.write_text(json.dumps({"psnr_avg_db": 13.5}))
+
+    row = build_leaderboard_row(run_id="r", psnr_json=psnr)
+
+    assert row["psnr_vs_fp16_mean"] == 13.5

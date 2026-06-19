@@ -301,6 +301,121 @@ def build_august_mixed_policy(
     }
 
 
+
+def qbasicvsr_bit_to_mode(bit_width: int, *, max_sensitive_mode: str = "a16w8", a4w4_enabled: bool = True) -> str:
+    """Map QBasicVSR effective bit width to a FlashVSR FakeQuant layer mode.
+
+    FlashVSR supports W4/W8 storage plus A4/A8/A16 activation choices, not the
+    paper's exact 4/5/6-bit recurrent-Conv design.  The first temporal-aware
+    policy therefore maps low-bit requests to A4W4 when enabled, mid-bit
+    requests to A8W8, and highly sensitive/protected requests to A16W8.
+    """
+
+    if max_sensitive_mode not in VALID_LAYER_MODES:
+        raise ValueError(f"Unsupported max_sensitive_mode: {max_sensitive_mode}")
+    bit_width = int(bit_width)
+    if bit_width <= 4 and a4w4_enabled:
+        return "a4w4"
+    if bit_width <= 8:
+        return "a8w8"
+    return max_sensitive_mode
+
+
+def _qbasicvsr_effective_bits_for_mode(mode: str, requested_bits: int) -> int:
+    if mode == "a16w8" or mode == "fp16_skip":
+        return 16
+    if mode in {"a8w8", "a8w4"}:
+        return 8
+    if mode in {"a4w4", "a16w4"}:
+        return 4
+    return int(requested_bits)
+
+
+def build_qbasicvsr_temporal_policy(
+    layer_names: list[str],
+    *,
+    b_base: int = 4,
+    video_bit_factor: int = 0,
+    layer_bit_factors: dict[str, int] | None = None,
+    spatial_sensitivity: dict[str, float] | None = None,
+    temporal_sensitivity: dict[str, float] | None = None,
+    thresholds: dict[str, Any] | None = None,
+    activation_qdq_mode: str = "draq_symmetric",
+    protect_groups: set[str] | list[str] | tuple[str, ...] = ("embed", "time", "head"),
+    max_sensitive_mode: str = "a16w8",
+    a4w4_enabled: bool = True,
+    flow_backend: str = "proxy",
+) -> dict[str, Any]:
+    """Build a QBasicVSR-inspired temporal mixed-bit policy for DiT Linears.
+
+    ``layer_bit_factors`` contains TS-LBA b_L decisions.  Protected FlashVSR
+    embedding/time/head groups are conservatively forced to ``max_sensitive_mode``
+    because they have atypical [B,C] shapes and historically high sensitivity.
+    """
+
+    if activation_qdq_mode not in VALID_ACTIVATION_QDQ_MODES:
+        raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
+    protected = set(protect_groups)
+    layer_bit_factors = layer_bit_factors or {}
+    spatial_sensitivity = spatial_sensitivity or {}
+    temporal_sensitivity = temporal_sensitivity or {}
+    thresholds = dict(thresholds or {})
+
+    layers: dict[str, dict[str, Any]] = {}
+    counts: dict[str, int] = {}
+    bit_sum = 0.0
+    for name in sorted(layer_names):
+        group = classify_layer_name(name)
+        b_layer = int(layer_bit_factors.get(name, 0))
+        requested_bits = int(b_base) + int(video_bit_factor) + b_layer
+        if group in protected:
+            mode = max_sensitive_mode
+            reason = f"protected {group} group: conservative A16 activation fallback"
+        else:
+            mode = qbasicvsr_bit_to_mode(
+                requested_bits,
+                max_sensitive_mode=max_sensitive_mode,
+                a4w4_enabled=a4w4_enabled,
+            )
+            reason = "QBasicVSR TS-LBA low/mid sensitivity" if b_layer <= 0 else "QBasicVSR TS-LBA high sensitivity"
+        effective_bits = _qbasicvsr_effective_bits_for_mode(mode, requested_bits)
+        entry: dict[str, Any] = {
+            "mode": mode,
+            "b_layer": b_layer,
+            "video_bit_factor": int(video_bit_factor),
+            "requested_bits": requested_bits,
+            "effective_bits": effective_bits,
+            "group": group,
+            "spatial_sensitivity": float(spatial_sensitivity.get(name, 0.0)),
+            "temporal_sensitivity": float(temporal_sensitivity.get(name, 0.0)),
+            "reason": reason,
+        }
+        if mode.startswith(("a8", "a4")):
+            entry["activation_qdq_mode"] = activation_qdq_mode
+        layers[name] = entry
+        counts[mode] = counts.get(mode, 0) + 1
+        bit_sum += effective_bits
+
+    total = len(layers)
+    fab = bit_sum / total if total else 0.0
+    return {
+        "schema_version": "flashvsr.qbasicvsr.temporal_policy.v1",
+        "paper": "QBasicVSR NeurIPS 2025 / OpenReview 6oTJCnTkUA",
+        "quant_scope": "dit_linear_only",
+        "scope": "WanVideoDiT Linear layers only; Wan VAE remains unquantized",
+        "wan_vae_quantized": False,
+        "base_bits": int(b_base),
+        "video_bit_factor": int(video_bit_factor),
+        "activation_qdq_mode": activation_qdq_mode,
+        "flow_backend": flow_backend,
+        "a4w4_enabled": bool(a4w4_enabled),
+        "protected_groups": sorted(protected),
+        "thresholds": thresholds,
+        "counts": counts,
+        "fab": fab,
+        "layers": layers,
+    }
+
 def load_layer_policy(path: str | Path) -> dict[str, Any]:
     raw = json.loads(Path(path).read_text())
     layers = raw.get("layers", raw)

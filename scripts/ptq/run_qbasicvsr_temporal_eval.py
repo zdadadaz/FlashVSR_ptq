@@ -54,8 +54,13 @@ def write_report(path: Path, *, run_id: str, row: dict, policy: dict, manifest: 
         "",
         f"- dry_run: {dry_run}",
         f"- psnr_vs_fp16_mean: {row.get('psnr_vs_fp16_mean')}",
+        f"- activation_qdq_mode: {row.get('activation_qdq_mode')}",
+        f"- clipping_method: {row.get('clipping')}",
+        f"- teacher_ft_steps: {row.get('teacher_ft_steps')}",
+        f"- static_ablation_label: {row.get('static_ablation_label')}",
         f"- policy: {row.get('policy')}",
         f"- checkpoint: {row.get('checkpoint')}",
+        f"- reproduce_script: {row.get('reproduce_script')}",
         f"- psnr_json: {row.get('psnr_json')}",
         f"- eval_set: {row.get('eval_set')}",
         f"- quant_scope: {policy.get('quant_scope')}",
@@ -88,6 +93,10 @@ def main() -> None:
     ap.add_argument("--dry_run", action="store_true")
     ap.add_argument("--fp16_video", default="", help="Existing FP16 video to reuse")
     ap.add_argument("--ptq_video", default="", help="Existing PTQ video to reuse")
+    ap.add_argument("--clipping_method", default="qbasicvsr_temporal", choices=["none", "qbasicvsr_temporal", "minmax_ema", "omse", "omse_teacher_clipft"])
+    ap.add_argument("--teacher_ft_steps", type=int, default=0)
+    ap.add_argument("--static_ablation_label", default="")
+    ap.add_argument("--reproduce_script", default="", help="Script that reproduces this leaderboard row/eval")
     args = ap.parse_args()
 
     root = Path.cwd()
@@ -118,7 +127,9 @@ def main() -> None:
     notes = (
         "QBasicVSR-inspired temporal policy; quant_scope=dit_linear_only; "
         f"wan_vae_quantized=false; bv={policy.get('video_bit_factor')}; base_bits={policy.get('base_bits')}; "
-        f"FAB={policy.get('fab')}; flow_backend={policy.get('flow_backend', 'proxy')}; a4_layers={a4}"
+        f"FAB={policy.get('fab')}; flow_backend={policy.get('flow_backend', 'proxy')}; a4_layers={a4}; "
+        f"clipping_method={args.clipping_method}; teacher_ft_steps={args.teacher_ft_steps}; "
+        f"static_ablation_label={args.static_ablation_label}"
     )
     manifest = {
         "schema_version": "flashvsr.qbasicvsr.temporal_eval.v1",
@@ -132,11 +143,33 @@ def main() -> None:
         "psnr_json": str(psnr_json),
         "eval_set": args.eval_set,
         "quantize_mode": _quantize_mode(policy),
+        "clipping_method": args.clipping_method,
+        "teacher_ft_steps": args.teacher_ft_steps,
+        "static_ablation_label": args.static_ablation_label,
+        "reproduce_script": args.reproduce_script,
         "notes": notes,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
 
-    row = build_leaderboard_row(run_id=args.run_id, policy=args.policy, checkpoint=args.checkpoint, manifest=manifest_path, psnr_json=psnr_json, a8_layers=a8, a16_layers=a16, activation_qdq_mode=policy.get("activation_qdq_mode", "draq_symmetric"), clipping="qbasicvsr_temporal", eval_set=args.eval_set, notes=notes)
+    row = build_leaderboard_row(
+        run_id=args.run_id,
+        policy=args.policy,
+        checkpoint=args.checkpoint,
+        manifest=manifest_path,
+        psnr_json=psnr_json,
+        reproduce_script=args.reproduce_script or None,
+        a8_layers=a8,
+        a16_layers=a16,
+        activation_qdq_mode=policy.get("activation_qdq_mode", "draq_symmetric"),
+        clipping=args.clipping_method,
+        eval_set=args.eval_set,
+        notes=notes,
+        teacher_ft_steps=args.teacher_ft_steps,
+        static_ablation_label=args.static_ablation_label,
+        fab=policy.get("fab"),
+        quant_scope=policy.get("quant_scope"),
+        wan_vae_quantized=bool(policy.get("wan_vae_quantized", False)),
+    )
     if not args.dry_run and row.get("psnr_vs_fp16_mean") is None:
         raise RuntimeError("Leaderboard row would have blank psnr_vs_fp16_mean")
     write_jsonl_row(args.leaderboard, row)

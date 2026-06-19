@@ -68,6 +68,11 @@ def build_leaderboard_row(
     total_steps: int | None = None,
     eval_set: str | None = None,
     notes: str = "",
+    teacher_ft_steps: int = 0,
+    static_ablation_label: str = "",
+    fab: float | None = None,
+    quant_scope: str | None = None,
+    wan_vae_quantized: bool | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": "flashvsr.static_mixed_leaderboard_row.v1",
@@ -93,6 +98,11 @@ def build_leaderboard_row(
         "freeze_step": freeze_step,
         "total_steps": total_steps,
         "eval_set": eval_set,
+        "teacher_ft_steps": int(teacher_ft_steps),
+        "static_ablation_label": static_ablation_label,
+        "FAB": fab,
+        "quant_scope": quant_scope,
+        "wan_vae_quantized": wan_vae_quantized,
         "psnr_json": str(psnr_json) if psnr_json else None,
         "psnr_vs_fp16_mean": _read_psnr_mean(psnr_json),
         "psnr_vs_gt_fp16": None,
@@ -147,6 +157,11 @@ def main() -> None:
     parser.add_argument("--total_steps", type=int, default=None)
     parser.add_argument("--eval_set", default=None)
     parser.add_argument("--notes", default="")
+    parser.add_argument("--teacher_ft_steps", type=int, default=0)
+    parser.add_argument("--static_ablation_label", default="")
+    parser.add_argument("--fab", type=float, default=None)
+    parser.add_argument("--quant_scope", default=None)
+    parser.add_argument("--wan_vae_quantized", action="store_true")
     args = parser.parse_args()
     row = build_leaderboard_row(
         run_id=args.run_id,
@@ -168,6 +183,11 @@ def main() -> None:
         total_steps=args.total_steps,
         eval_set=args.eval_set,
         notes=args.notes,
+        teacher_ft_steps=args.teacher_ft_steps,
+        static_ablation_label=args.static_ablation_label,
+        fab=args.fab,
+        quant_scope=args.quant_scope,
+        wan_vae_quantized=args.wan_vae_quantized,
     )
     write_jsonl_row(args.leaderboard, row)
     print(f"[leaderboard] appended {args.run_id} → {args.leaderboard}")

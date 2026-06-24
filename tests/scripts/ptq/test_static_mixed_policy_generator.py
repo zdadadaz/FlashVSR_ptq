@@ -31,7 +31,8 @@ def test_static_mixed_policy_uses_top_mse_layers_as_a16w8():
     assert policy["summary"]["a8w8_layers"] == 2
     assert policy["layers"]["blocks.0.self_attn.k"]["mode"] == "a16w8"
     assert policy["layers"]["blocks.0.ffn.0"]["mode"] == "a16w8"
-    assert policy["layers"]["blocks.0.self_attn.q"]["activation_qdq_mode"] == "static_tensor_symmetric"
+    assert policy["layers"]["blocks.0.self_attn.q"]["activation_qdq_mode"] == "static_token_asymmetric"
+    assert policy["default"]["activation_qdq_mode"] == "static_token_asymmetric"
 
     entries = layer_policy_entries(policy)
     assert entries["blocks.0.self_attn.k"]["mode"] == "a16w8"

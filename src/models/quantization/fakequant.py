@@ -24,6 +24,7 @@ ACTIVATION_QDQ_MODE_TO_ID = {
     "draq_static_sd_layer": 5,
     "draq_static_sd_bucket": 6,
     "static_tensor_symmetric": 7,  # per-tensor/per-channel symmetric, output_qdq enabled
+    "static_token_asymmetric": 8,  # calibrated per-token asymmetric qparams from production trace
 }
 
 DRAQ_STATIC_MODES = {"draq_static_s", "draq_static_sd_layer", "draq_static_sd_bucket"}
@@ -323,6 +324,56 @@ class FakeQuantLinear(nn.Module):
         else:
             self.register_buffer("bias", None)
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """Resize token-static qparam buffers before state_dict loading."""
+        act_scale_key = prefix + "act_scale"
+        act_zp_key = prefix + "act_zero_point"
+        if act_scale_key in state_dict and self.act_scale is not None:
+            saved_scale = state_dict[act_scale_key]
+            if tuple(saved_scale.shape) != tuple(self.act_scale.shape):
+                self.act_scale = saved_scale.detach().clone().to(
+                    device=self.act_scale.device, dtype=self.act_scale.dtype
+                )
+        if act_zp_key in state_dict and self.act_zero_point is not None:
+            saved_zp = state_dict[act_zp_key]
+            if tuple(saved_zp.shape) != tuple(self.act_zero_point.shape):
+                self.act_zero_point = saved_zp.detach().clone().to(
+                    device=self.act_zero_point.device, dtype=self.act_zero_point.dtype
+                )
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+
+    def _reshape_activation_qparam(self, qparam: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Return a calibrated qparam in a shape broadcastable to ``x``."""
+        q = qparam.to(device=x.device, dtype=torch.float32)
+        if q.numel() == 1:
+            return q.reshape(*([1] * x.dim()))
+        if q.dim() == 1:
+            if q.numel() == self.in_features:
+                return q.reshape(*([1] * (x.dim() - 1)), self.in_features)
+            if x.dim() >= 2 and q.numel() == x.shape[-2]:
+                # Production-trace per-token qparams are stored as [tokens]
+                # and must broadcast over the feature dimension: [1, L, 1].
+                return q.reshape(*([1] * (x.dim() - 2)), q.numel(), 1)
+        if q.dim() == x.dim() - 1:
+            q = q.unsqueeze(0)
+        while q.dim() > x.dim() and q.shape[0] == 1:
+            q = q.squeeze(0)
+        if q.dim() > x.dim():
+            raise ValueError(f"Activation qparam rank {q.dim()} is not broadcastable to input rank {x.dim()}")
+        while q.dim() < x.dim():
+            q = q.unsqueeze(0)
+        try:
+            torch.broadcast_shapes(tuple(q.shape), tuple(x.shape))
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Activation qparam shape {tuple(q.shape)} is not broadcastable to input shape {tuple(x.shape)}"
+            ) from exc
+        return q
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
         x_float = x.detach().to(torch.float32)
@@ -418,14 +469,10 @@ class FakeQuantLinear(nn.Module):
             else:
                 # Static calibrated signed-int8 activation QDQ.
                 # act_scale / act_zero_point are collected by fakequant_calibrate.py
-                # and loaded by fakequant_convert.py.  Reshape dynamically so both
-                # 2D inputs [B,C] and sequence inputs [B,L,C] broadcast correctly.
-                x_scale = self.act_scale.to(device=x.device, dtype=torch.float32).reshape(
-                    *([1] * (x.dim() - 1)), self.in_features
-                ).clamp(min=1e-6)
-                x_zero_point = self.act_zero_point.to(device=x.device, dtype=torch.float32).reshape(
-                    *([1] * (x.dim() - 1)), self.in_features
-                )
+                # and loaded by fakequant_convert.py. Reshape dynamically so both
+                # legacy per-channel and production-trace per-token layouts work.
+                x_scale = self._reshape_activation_qparam(self.act_scale, x).clamp(min=1e-6)
+                x_zero_point = self._reshape_activation_qparam(self.act_zero_point, x)
                 x_q = torch.clamp(torch.round(x_float / x_scale + x_zero_point), -128, 127).to(torch.int8)
                 x_fp = (x_q.to(torch.float32) - x_zero_point) * x_scale
         else:
@@ -691,19 +738,28 @@ class FakeQuantLinear(nn.Module):
                 else:
                     act_scale_to_store = act_scale_to_store.reshape(-1) * sq
             if act_scale_to_store.numel() == 1:
-                new_module.act_scale.copy_(act_scale_to_store.reshape(1, 1, 1).expand_as(new_module.act_scale))
-            elif act_scale_to_store.dim() == 1:
+                if activation_qdq_mode == "static_tensor_symmetric":
+                    # Preserve true scalar per-tensor static qparams. Expanding to
+                    # [1,1,C] would force the forward path into per-channel mode.
+                    new_module.act_scale = act_scale_to_store.reshape(1).detach().clone().to(device=device, dtype=torch.float32)
+                else:
+                    new_module.act_scale.copy_(act_scale_to_store.reshape(1, 1, 1).expand_as(new_module.act_scale))
+            elif act_scale_to_store.dim() == 1 and act_scale_to_store.numel() == linear_module.in_features:
                 new_module.act_scale.copy_(act_scale_to_store.view(1, 1, -1))
-            else:
+            elif tuple(act_scale_to_store.shape) == tuple(new_module.act_scale.shape):
                 new_module.act_scale.copy_(act_scale_to_store)
+            else:
+                new_module.act_scale = act_scale_to_store.detach().clone().to(device=device, dtype=torch.float32)
 
             if act_zero_point is not None:
                 if act_zero_point.numel() == 1:
                     new_module.act_zero_point.copy_(act_zero_point.reshape(1, 1, 1).expand_as(new_module.act_zero_point))
-                elif act_zero_point.dim() == 1:
+                elif act_zero_point.dim() == 1 and act_zero_point.numel() == linear_module.in_features:
                     new_module.act_zero_point.copy_(act_zero_point.view(1, 1, -1))
-                else:
+                elif tuple(act_zero_point.shape) == tuple(new_module.act_zero_point.shape):
                     new_module.act_zero_point.copy_(act_zero_point)
+                else:
+                    new_module.act_zero_point = act_zero_point.detach().clone().to(device=device, dtype=torch.int32)
 
         if linear_module.bias is not None:
             new_module.bias.copy_(linear_module.bias.data.float())
@@ -816,15 +872,28 @@ class _FakeQuantConvNd(nn.Module):
 
     conv_dim = None
 
-    def __init__(self, conv_module: nn.Module, activation_mode: str = "a8", weight_mode: str = "w8"):
+    def __init__(
+        self,
+        conv_module: nn.Module,
+        activation_mode: str = "a8",
+        weight_mode: str = "w8",
+        activation_qdq_mode: str = "dynamic_symmetric",
+        cache: dict | None = None,
+    ):
         super().__init__()
         if weight_mode != "w8":
             raise ValueError("FakeQuantConv currently supports W8 only")
         if activation_mode not in ("a8", "a16"):
             raise ValueError(f"Unsupported activation mode: {activation_mode}")
+        if activation_qdq_mode not in ACTIVATION_QDQ_MODE_TO_ID:
+            raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
 
         self.activation_mode = activation_mode
         self.weight_mode = weight_mode
+        self.register_buffer(
+            "activation_qdq_mode",
+            torch.tensor(ACTIVATION_QDQ_MODE_TO_ID[activation_qdq_mode], dtype=torch.int32),
+        )
         self.in_channels = conv_module.in_channels
         self.out_channels = conv_module.out_channels
         self.kernel_size = conv_module.kernel_size
@@ -845,18 +914,49 @@ class _FakeQuantConvNd(nn.Module):
         w_int8 = torch.clamp(torch.round(w / w_scale), -127, 127).to(torch.int8)
         self.register_buffer("weight_int", w_int8)
         self.register_buffer("weight_scale", w_scale.to(torch.float32))
+        scale_shape = (1, self.in_channels) + (1,) * int(self.conv_dim or 0)
+        self.register_buffer("act_scale", torch.ones(scale_shape, dtype=torch.float32, device=w.device))
+        self.register_buffer("act_zero_point", torch.zeros(scale_shape, dtype=torch.int32, device=w.device))
+        if cache:
+            self.set_activation_cache(cache)
         if conv_module.bias is not None:
             self.register_buffer("bias", conv_module.bias.detach().to(torch.float32).clone())
         else:
             self.register_buffer("bias", None)
 
+    def set_activation_cache(self, cache: dict):
+        scale = cache.get("act_scale", cache.get("scale")) if isinstance(cache, dict) else None
+        zero_point = cache.get("act_zero_point", cache.get("zero_point")) if isinstance(cache, dict) else None
+        if scale is None:
+            return
+        s = _to_tensor(scale, device=self.act_scale.device, dtype=torch.float32).reshape(-1)
+        if s.numel() == 1:
+            s = s.expand(self.in_channels)
+        if s.numel() != self.in_channels:
+            raise ValueError(f"Conv activation scale has {s.numel()} values, expected {self.in_channels}")
+        self.act_scale.copy_(s.reshape_as(self.act_scale).clamp(min=1e-6))
+        if zero_point is not None:
+            zp = _to_tensor(zero_point, device=self.act_zero_point.device, dtype=torch.int32).reshape(-1)
+            if zp.numel() == 1:
+                zp = zp.expand(self.in_channels)
+            if zp.numel() != self.in_channels:
+                raise ValueError(f"Conv activation zero_point has {zp.numel()} values, expected {self.in_channels}")
+            self.act_zero_point.copy_(zp.reshape_as(self.act_zero_point))
+
     def _qdq_activation(self, x: torch.Tensor) -> torch.Tensor:
         if self.activation_mode != "a8":
             return x.to(torch.float32)
         x_float = x.detach().to(torch.float32)
-        # Per-sample, per-input-channel dynamic scale; reduce spatial/temporal dims.
-        reduce_dims = tuple(d for d in range(x_float.dim()) if d != 1)
-        x_scale = torch.amax(torch.abs(x_float), dim=reduce_dims, keepdim=True).clamp(min=1e-6) / 127.0
+        qdq_mode = int(self.activation_qdq_mode.item())
+        if qdq_mode == ACTIVATION_QDQ_MODE_TO_ID["static_tensor_symmetric"]:
+            # Static calibrated per-input-channel symmetric Conv activation QDQ.
+            # Cache is collected by hooks on the real TCDecoder inference path and
+            # injected through from_float(cache=...), mirroring DiT static buffers.
+            x_scale = self.act_scale.to(device=x.device, dtype=torch.float32).clamp(min=1e-6)
+        else:
+            # Per-sample, per-input-channel dynamic scale; reduce spatial/temporal dims.
+            reduce_dims = tuple(d for d in range(x_float.dim()) if d != 1)
+            x_scale = torch.amax(torch.abs(x_float), dim=reduce_dims, keepdim=True).clamp(min=1e-6) / 127.0
         x_q = torch.clamp(torch.round(x_float / x_scale), -127, 127).to(torch.int8)
         return x_q.to(torch.float32) * x_scale
 
@@ -868,10 +968,23 @@ class FakeQuantConv2d(_FakeQuantConvNd):
     conv_dim = 2
 
     @classmethod
-    def from_float(cls, conv_module: nn.Conv2d, activation_mode: str = "a8", weight_mode: str = "w8"):
+    def from_float(
+        cls,
+        conv_module: nn.Conv2d,
+        activation_mode: str = "a8",
+        weight_mode: str = "w8",
+        activation_qdq_mode: str = "dynamic_symmetric",
+        cache: dict | None = None,
+    ):
         if not isinstance(conv_module, nn.Conv2d):
             raise TypeError(f"Expected nn.Conv2d, got {type(conv_module)}")
-        return cls(conv_module, activation_mode=activation_mode, weight_mode=weight_mode)
+        return cls(
+            conv_module,
+            activation_mode=activation_mode,
+            weight_mode=weight_mode,
+            activation_qdq_mode=activation_qdq_mode,
+            cache=cache,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
@@ -894,10 +1007,23 @@ class FakeQuantConv3d(_FakeQuantConvNd):
     conv_dim = 3
 
     @classmethod
-    def from_float(cls, conv_module: nn.Conv3d, activation_mode: str = "a8", weight_mode: str = "w8"):
+    def from_float(
+        cls,
+        conv_module: nn.Conv3d,
+        activation_mode: str = "a8",
+        weight_mode: str = "w8",
+        activation_qdq_mode: str = "dynamic_symmetric",
+        cache: dict | None = None,
+    ):
         if not isinstance(conv_module, nn.Conv3d):
             raise TypeError(f"Expected nn.Conv3d, got {type(conv_module)}")
-        return cls(conv_module, activation_mode=activation_mode, weight_mode=weight_mode)
+        return cls(
+            conv_module,
+            activation_mode=activation_mode,
+            weight_mode=weight_mode,
+            activation_qdq_mode=activation_qdq_mode,
+            cache=cache,
+        )
 
     def forward(self, x: torch.Tensor, cache_x: torch.Tensor = None) -> torch.Tensor:
         orig_dtype = x.dtype
@@ -1097,16 +1223,17 @@ def convert_model_to_fakequant(
                     act_scale = s.get("act_scale", None)
                 act_zp = s.get("zero_point", None)
                 act_mean = s.get("act_mean", None)
-                draq_s = s.get("draq_s_percentile_999", None)
-                if draq_s is None:
-                    draq_s = s.get("draq_s_percentile_99", s.get("draq_s_absmax", None))
-                draq_d = s.get("draq_d_percentile_999", None)
-                if draq_d is None:
-                    draq_d = s.get("draq_d_percentile_99", s.get("draq_d_absmax", None))
-                draq_d_buckets = s.get("draq_d_by_bucket", None)
+                if layer_qdq_mode in DRAQ_STATIC_MODES:
+                    draq_s = s.get("draq_s_percentile_999", None)
+                    if draq_s is None:
+                        draq_s = s.get("draq_s_percentile_99", s.get("draq_s_absmax", None))
+                    draq_d = s.get("draq_d_percentile_999", None)
+                    if draq_d is None:
+                        draq_d = s.get("draq_d_percentile_99", s.get("draq_d_absmax", None))
+                    draq_d_buckets = s.get("draq_d_by_bucket", None)
         if (
             layer_activation_mode == "a8"
-            and layer_qdq_mode == "static_asymmetric"
+            and layer_qdq_mode in ("static_asymmetric", "static_token_asymmetric")
             and act_stats is not None
             and act_scale is None
         ):
@@ -1426,11 +1553,146 @@ def get_all_linear_layers(model) -> list:
     ]
 
 
+def attach_fakequant_conv_calibration_hooks(
+    model,
+    prefix: str = "",
+    op_types=("conv2d", "conv3d"),
+):
+    """Attach hooks that collect activation amax for static extra-op QDQ.
+
+    The collected cache is intentionally keyed by module name and can be fed back
+    into convert_ops_to_fakequant(..., calibration_cache=cache,
+    activation_qdq_mode="static_tensor_symmetric"). Conv channel axis is dim=1;
+    Linear feature axis is the last dim.
+
+    Historical name kept for compatibility; despite "conv" in the name it can
+    also collect Linear stats when "linear" is included in op_types.
+    """
+    op_types = set(op_types or ())
+    stats: dict[str, dict] = {}
+    hooks = []
+
+    def make_hook(name: str, kind: str):
+        def hook_fn(module, inputs, output):
+            if not inputs:
+                return
+            x = inputs[0]
+            if not isinstance(x, torch.Tensor) or x.numel() == 0:
+                return
+            x = x.detach().to(torch.float32)
+            channel_dim = x.dim() - 1 if kind == "linear" else 1
+            if kind == "linear" and x.dim() >= 3:
+                # Static-token Linear qparams: one asymmetric qparam per token,
+                # reducing over batch and feature dimensions.
+                reduce_dims = tuple(d for d in range(x.dim()) if d != x.dim() - 2)
+                act_min = torch.amin(x, dim=reduce_dims).cpu()
+                act_max = torch.amax(x, dim=reduce_dims).cpu()
+                entry = stats.setdefault(name, {"op_type": kind, "min": [], "max": []})
+                entry["min"].append(act_min)
+                entry["max"].append(act_max)
+            else:
+                reduce_dims = tuple(d for d in range(x.dim()) if d != channel_dim)
+                amax = torch.amax(torch.abs(x), dim=reduce_dims).cpu()
+                entry = stats.setdefault(name, {"op_type": kind, "amax": []})
+                entry["amax"].append(amax)
+        return hook_fn
+
+    def make_lq_linear_proxy_hook(linear_names: list[str]):
+        """Collect Causal_LQ4x_Proj Linear input stats from act2 output.
+
+        Linear input is act2 output rearranged from [B, C, F, H, W] to
+        [B, FHW, C], so per-input-channel amax is identical to reducing act2
+        output over all dims except channel dim=1. This covers FlashVSR tiny
+        boundary slices where conv2 executes but Linear may not receive a
+        non-empty token tensor during the calibration pass.
+        """
+        def hook_fn(module, inputs, output):
+            x = output[0] if isinstance(output, (tuple, list)) else output
+            if not isinstance(x, torch.Tensor) or x.numel() == 0:
+                return
+            x = x.detach().to(torch.float32)
+            # [B, C, F, H, W] -> [B, FHW, C], then per-token min/max over
+            # batch and feature dimensions for static_token_asymmetric Linear.
+            x_tokens = x.permute(0, 2, 3, 4, 1).reshape(x.shape[0], -1, x.shape[1])
+            act_min = torch.amin(x_tokens, dim=(0, 2)).cpu()
+            act_max = torch.amax(x_tokens, dim=(0, 2)).cpu()
+            for linear_name in linear_names:
+                entry = stats.setdefault(linear_name, {"op_type": "linear", "min": [], "max": []})
+                entry["min"].append(act_min)
+                entry["max"].append(act_max)
+        return hook_fn
+
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        kind = None
+        if "conv3d" in op_types and isinstance(module, nn.Conv3d):
+            kind = "conv3d"
+        elif "conv2d" in op_types and isinstance(module, nn.Conv2d):
+            kind = "conv2d"
+        elif "linear" in op_types and isinstance(module, nn.Linear):
+            kind = "linear"
+        if kind is None:
+            continue
+        full_name = f"{prefix}.{name}" if prefix else name
+        hooks.append(module.register_forward_hook(make_hook(full_name, kind)))
+    if "linear" in op_types and hasattr(model, "linear_layers") and hasattr(model, "act2"):
+        linear_names = [f"{prefix}.linear_layers.{i}" if prefix else f"linear_layers.{i}" for i, _ in enumerate(model.linear_layers)]
+        if linear_names:
+            hooks.append(model.act2.register_forward_hook(make_lq_linear_proxy_hook(linear_names)))
+    return hooks, stats
+
+
+def export_fakequant_conv_calibration_cache(stats: dict) -> dict:
+    """Convert hook stats to a JSON-serializable static symmetric extra-op cache.
+
+    Historical name kept for compatibility. Supports Conv and Linear entries.
+    """
+    layers = {}
+    for name, entry in stats.items():
+        if entry.get("op_type") == "linear" and entry.get("min") and entry.get("max"):
+            all_min = torch.stack([s.to(torch.float32).reshape(-1) for s in entry["min"]], dim=0).amin(dim=0)
+            all_max = torch.stack([s.to(torch.float32).reshape(-1) for s in entry["max"]], dim=0).amax(dim=0)
+            qmin, qmax = -128.0, 127.0
+            scale = ((all_max - all_min) / (qmax - qmin)).clamp(min=1e-6)
+            zero_point = torch.round(qmin - all_min / scale).clamp(qmin, qmax).to(torch.int32)
+            layers[name] = {
+                "op_type": "linear",
+                "act_scale": scale.tolist(),
+                "act_zero_point": zero_point.tolist(),
+                "act_min": all_min.tolist(),
+                "act_max": all_max.tolist(),
+                "activation_qdq_mode": "static_token_asymmetric",
+                "granularity": "per_token_asymmetric",
+            }
+            continue
+        samples = entry.get("amax", [])
+        if not samples:
+            continue
+        amax = torch.stack([s.to(torch.float32).reshape(-1) for s in samples], dim=0).amax(dim=0)
+        scale = (amax / 127.0).clamp(min=1e-6)
+        layers[name] = {
+            "op_type": entry.get("op_type", "conv"),
+            "act_scale": scale.tolist(),
+            "act_zero_point": torch.zeros_like(scale, dtype=torch.int32).tolist(),
+            "act_amax": amax.tolist(),
+            "activation_qdq_mode": "static_tensor_symmetric",
+        }
+    return {
+        "schema_version": "flashvsr.fakequant.extra_op_calibration.v2",
+        "granularity": "per_input_channel_symmetric",
+        "layers": layers,
+        "summary": {"num_layers": len(layers)},
+    }
+
+
 def convert_ops_to_fakequant(
     model,
     mode: str = "a8w8",
     op_types=("linear",),
     prefix: str = "",
+    activation_qdq_mode: str = "dynamic_symmetric",
+    calibration_cache: dict | None = None,
 ):
     """Recursively replace selected op types with FakeQuant QDQ modules.
 
@@ -1439,6 +1701,11 @@ def convert_ops_to_fakequant(
         mode: a8w8/a16w8. Conv ops currently support W8 only.
         op_types: iterable containing any of: linear, conv2d, conv3d.
         prefix: optional name prefix for logging only.
+        activation_qdq_mode: Conv/extra-op activation QDQ mode. The default keeps
+            the historical dynamic per-input-channel behavior; static_tensor_symmetric
+            consumes calibration_cache and bakes act_scale buffers.
+        calibration_cache: optional hook-collected cache from
+            attach_fakequant_conv_calibration_hooks/export_fakequant_conv_calibration_cache.
     """
     if mode.startswith("a16"):
         activation_mode, weight_mode = "a16", mode[3:]
@@ -1450,10 +1717,17 @@ def convert_ops_to_fakequant(
         raise ValueError(f"Unsupported fakequant mode: {mode}")
     if weight_mode != "w8":
         raise ValueError("Conv/LQ/VAE/TCDecoder op fakequant currently supports W8 modes only")
+    if activation_qdq_mode not in ACTIVATION_QDQ_MODE_TO_ID:
+        raise ValueError(f"Unsupported activation_qdq_mode: {activation_qdq_mode}")
+
+    cache_layers = {}
+    if calibration_cache:
+        cache_layers = calibration_cache.get("layers", calibration_cache)
 
     op_types = set(op_types or ())
     converted = {"linear": 0, "conv2d": 0, "conv3d": 0}
     fallback = 0
+    missing_static_stats = []
 
     def get_parent_and_name(mod, full_name):
         parts = full_name.rsplit(".", 1)
@@ -1468,26 +1742,57 @@ def convert_ops_to_fakequant(
         if full_name == "":
             continue
         kind = None
-        factory = None
         # Conv3d before Conv2d is not necessary but keeps subclass intent explicit.
         if "conv3d" in op_types and isinstance(module, nn.Conv3d):
-            kind, factory = "conv3d", FakeQuantConv3d.from_float
+            kind = "conv3d"
         elif "conv2d" in op_types and isinstance(module, nn.Conv2d):
-            kind, factory = "conv2d", FakeQuantConv2d.from_float
+            kind = "conv2d"
         elif "linear" in op_types and isinstance(module, nn.Linear):
             kind = "linear"
-            factory = lambda m, activation_mode, weight_mode: FakeQuantLinear.from_float(
-                m, activation_mode=activation_mode, weight_mode=weight_mode
-            )
         if kind is None:
             continue
         try:
-            new_mod = factory(module, activation_mode=activation_mode, weight_mode=weight_mode)
+            if kind in ("conv2d", "conv3d"):
+                prefixed = f"{prefix}.{full_name}" if prefix else full_name
+                cache = (cache_layers.get(prefixed) or cache_layers.get(full_name)) if cache_layers else None
+                if activation_qdq_mode == "static_tensor_symmetric" and cache is None:
+                    missing_static_stats.append(prefixed)
+                    continue
+                conv_factory = FakeQuantConv3d.from_float if kind == "conv3d" else FakeQuantConv2d.from_float
+                new_mod = conv_factory(
+                    module,
+                    activation_mode=activation_mode,
+                    weight_mode=weight_mode,
+                    activation_qdq_mode=activation_qdq_mode,
+                    cache=cache,
+                )
+            else:
+                prefixed = f"{prefix}.{full_name}" if prefix else full_name
+                cache = (cache_layers.get(prefixed) or cache_layers.get(full_name)) if cache_layers else None
+                if activation_qdq_mode == "static_tensor_symmetric" and cache is None:
+                    missing_static_stats.append(prefixed)
+                    continue
+                linear_qdq_mode = cache.get("activation_qdq_mode", activation_qdq_mode) if cache else activation_qdq_mode
+                new_mod = FakeQuantLinear.from_float(
+                    module,
+                    activation_mode=activation_mode,
+                    weight_mode=weight_mode,
+                    activation_qdq_mode=linear_qdq_mode,
+                    act_scale=cache.get("act_scale") if cache else None,
+                    act_zero_point=cache.get("act_zero_point") if cache else None,
+                )
             parent, leaf_name = get_parent_and_name(model, full_name)
             setattr(parent, leaf_name, new_mod)
             converted[kind] += 1
         except Exception as e:
             print(f"  [FakeQuantOps] Failed to convert {prefix + '.' if prefix else ''}{full_name}: {e}")
             fallback += 1
+    if missing_static_stats:
+        preview = ", ".join(missing_static_stats[:8])
+        suffix = "..." if len(missing_static_stats) > 8 else ""
+        raise RuntimeError(
+            f"Static FakeQuant extra-op conversion requires calibration cache for every converted op; "
+            f"missing {len(missing_static_stats)} layer(s): {preview}{suffix}"
+        )
     print(f"[FakeQuantOps] {prefix or type(model).__name__}: mode={mode} converted={converted} fallback={fallback}")
     return model

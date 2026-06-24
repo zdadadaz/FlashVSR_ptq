@@ -91,7 +91,7 @@ def build_static_mixed_policy_from_rows(
     rows: Iterable[dict[str, Any]],
     *,
     a16_percent: float,
-    default_activation_qdq_mode: str = "static_tensor_symmetric",
+    default_activation_qdq_mode: str = "static_token_asymmetric",
     metric_key: str = "output_mse",
 ) -> dict[str, Any]:
     ranked = []
@@ -159,7 +159,7 @@ def main() -> None:
     parser.add_argument("--sensitivity_json", required=True)
     parser.add_argument("--a16_percent", required=True, help="Comma-separated percentages, e.g. 10,20,40,60")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--activation_qdq_mode", default="static_tensor_symmetric")
+    parser.add_argument("--activation_qdq_mode", default="static_token_asymmetric")
     args = parser.parse_args()
 
     rows = load_sensitivity_rows(args.sensitivity_json)

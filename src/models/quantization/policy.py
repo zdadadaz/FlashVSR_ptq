@@ -14,7 +14,7 @@ from typing import Any
 VALID_LAYER_MODES = {"a16w8", "a8w8", "a16w4", "a8w4", "a4w4", "fp16_skip"}
 VALID_ACTIVATION_QDQ_MODES = {
     "static_asymmetric",
-    "static_tensor_symmetric",
+    "static_token_asymmetric",
     "dynamic_symmetric",
     "dynamic_asymmetric",
     "draq_symmetric",

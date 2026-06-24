@@ -388,12 +388,13 @@ def main():
         ),
     )
     parser.add_argument(
-        "--activation_qdq_mode", type=str, default="static_asymmetric",
+        "--activation_qdq_mode", type=str, default="static_token_asymmetric",
         choices=list(ACTIVATION_QDQ_MODE_TO_ID),
         help=(
-            "Activation QDQ policy. A8 static_asymmetric uses calibrated per-channel "
-            "scale/zero_point from --calibration_cache. dynamic_symmetric and "
-            "dynamic_asymmetric compute per-token activation scales at runtime; "
+            "Activation QDQ policy. Static A8 defaults to static_token_asymmetric: "
+            "calibrated per-token qparams from a dynamic FakeQuant production inference trace. "
+            "Legacy static_asymmetric uses calibrated per-channel scale/zero_point. "
+            "dynamic_symmetric and dynamic_asymmetric compute per-token activation scales at runtime; "
             "draq_symmetric uses LSGQuant online channel+token scaling. "
             "draq_static_s, draq_static_sd_layer and draq_static_sd_bucket use "
             "calibration-derived DRAQ static fields."
@@ -443,6 +444,12 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.activation_qdq_mode == "static_tensor_symmetric":
+        raise SystemExit(
+            "static_tensor_symmetric / mode 7 has been retired from the supported static PTQ path. "
+            "Use dynamic FakeQuant trace calibration and --activation_qdq_mode static_token_asymmetric."
+        )
+
     # ------------------------------------------------------------------
     # 1. Load full-precision model
     # ------------------------------------------------------------------
@@ -458,7 +465,7 @@ def main():
     if args.calibration_cache:
         act_stats = load_calibration_cache(args.calibration_cache)
         print(f"[Convert] Loaded calibration for {len(act_stats)} layers")
-    static_cache_modes = {"static_asymmetric", "draq_static_s", "draq_static_sd_layer", "draq_static_sd_bucket"}
+    static_cache_modes = {"static_asymmetric", "static_token_asymmetric", "draq_static_s", "draq_static_sd_layer", "draq_static_sd_bucket"}
     if args.mode.startswith("a8") and args.activation_qdq_mode in static_cache_modes and not act_stats:
         raise RuntimeError(
             f"Mode {args.mode} with {args.activation_qdq_mode} activation QDQ requires a non-empty "

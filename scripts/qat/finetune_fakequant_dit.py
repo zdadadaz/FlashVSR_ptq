@@ -105,6 +105,19 @@ def move_sample(sample: dict[str, Any], device: torch.device, dtype: torch.dtype
     return out
 
 
+def policy_requires_static_observer(layer_policy: dict[str, Any] | None, activation_qdq_mode: str) -> bool:
+    """Return true when any QAT layer will use observer-derived static qparams."""
+
+    if activation_qdq_mode == "static_asymmetric":
+        return True
+    if not layer_policy:
+        return False
+    for entry in layer_policy.values():
+        if isinstance(entry, dict) and entry.get("activation_qdq_mode") == "static_asymmetric":
+            return True
+    return False
+
+
 def save_state_dict(model: torch.nn.Module, output: str | Path) -> None:
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -150,7 +163,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         volts_adaptation_summary = {"enabled": True, "plan": plan, "trainability": trainability}
         print(f"[QAT] VOLTS adaptation trainability: {trainability}")
     observer_summary: dict[str, Any] = {"enabled": False, "freeze_step": int(args.observer_freeze_step)}
-    use_static_observer = args.activation_qdq_mode == "static_asymmetric" and not args.calibration_cache and args.observer_freeze_step >= 0
+    use_static_observer = policy_requires_static_observer(layer_policy, args.activation_qdq_mode) and not args.calibration_cache and args.observer_freeze_step >= 0
     if use_static_observer:
         set_qat_observer(student, True, ema_decay=args.observer_ema_decay)
         observer_summary["enabled"] = True

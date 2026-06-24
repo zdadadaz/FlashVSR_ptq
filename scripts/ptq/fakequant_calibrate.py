@@ -280,18 +280,19 @@ def _compute_mu_var(mu_samples_mean) -> float:
     return float(mu.var(dim=0, unbiased=True).mean().item())
 
 
-def build_lsgquant_calibration_cache(act_stats: dict | None, metadata: dict) -> dict:
+def build_lsgquant_calibration_cache(act_stats: dict | None, metadata: dict, output_stats: dict | None = None) -> dict:
     """Serialize FakeQuant calibration stats with LSGQuant/VOLTS fields.
 
     Keeps legacy act_scale/zero_point fields for fakequant_convert.py while adding
     act_min/act_max/act_mean, per-sample channel means, and mu_var for PR-2 policy
-    generation.
+    generation. ``output_stats`` (optional) adds per-output-channel output_scale /
+    output_zero_point for mode-7 static_tensor_symmetric + output QDQ.
     """
 
     cache = {"_metadata": dict(metadata)}
     cache["_metadata"].update({
-        "schema_version": "flashvsr.lsgquant.calibration.v1",
-        "stats": ["act_scale", "zero_point", "act_min", "act_max", "act_mean", "mu_mean", "mu_var"],
+        "schema_version": "flashvsr.lsgquant.calibration.v2",
+        "stats": ["act_scale", "zero_point", "act_min", "act_max", "act_mean", "mu_mean", "mu_var", "output_scale", "output_zero_point"],
     })
     if not act_stats:
         return cache
@@ -311,6 +312,37 @@ def build_lsgquant_calibration_cache(act_stats: dict | None, metadata: dict) -> 
             entry["mu_var"] = _compute_mu_var(mu_samples)
         else:
             entry["mu_var"] = 0.0
+
+        # Static-DRAQ calibration fields. The GPU calibrator keeps per-forward
+        # min/max summaries instead of full activation samples to avoid retaining
+        # huge WanModel tensors. Use the conservative per-channel absolute range
+        # as the fixed static s_i; normalized activations are then bounded by
+        # d=1 for layer/bucket static modes, while draq_static_s still computes
+        # token d_j dynamically at runtime.
+        if "act_min" in s and "act_max" in s:
+            act_min = torch.as_tensor(s["act_min"]).float()
+            act_max = torch.as_tensor(s["act_max"]).float()
+            draq_s = torch.maximum(act_min.abs(), act_max.abs()).clamp(min=1e-6)
+            entry.update({
+                "draq_s_absmax": _tensor_to_json_list(draq_s),
+                "draq_s_percentile_99": _tensor_to_json_list(draq_s),
+                "draq_s_percentile_999": _tensor_to_json_list(draq_s),
+                "draq_d_absmax": 1.0,
+                "draq_d_percentile_99": 1.0,
+                "draq_d_percentile_999": 1.0,
+                "draq_d_by_bucket": {"all": 1.0},
+            })
+            mu_var = float(entry.get("mu_var", 0.0) or 0.0)
+            if mu_var < 0.001:
+                entry["volts_tier"] = "frozen"
+            elif mu_var < 0.075:
+                entry["volts_tier"] = "light"
+            else:
+                entry["volts_tier"] = "full"
+        # Per-output-channel output QDQ fields (mode 7 static_tensor_symmetric).
+        if output_stats and name in output_stats:
+            entry["output_scale"] = _tensor_to_json_list(output_stats[name]["output_scale"])
+            entry["output_zero_point"] = _tensor_to_json_list(output_stats[name]["output_zero_point"])
         cache[name] = entry
     return cache
 
@@ -416,15 +448,16 @@ def main():
     # 4. Collect activation statistics (only meaningful when a8 is used)
     # ------------------------------------------------------------------
     act_stats = None
+    output_stats = None
     if args.mode.startswith("a8"):
         print(f"\n[Calibrate] Running {args.num_samples} forward passes for activation stats …")
-        act_stats = collect_activation_stats_fakequant(
+        act_stats, output_stats = collect_activation_stats_fakequant(
             model,
             latents,
             contexts,
             num_samples=args.num_samples,
         )
-        print(f"[Calibrate] Collected stats for {len(act_stats)} layers")
+        print(f"[Calibrate] Collected input stats for {len(act_stats)} layers, output stats for {len(output_stats)} layers")
     else:
         print(f"\n[Calibrate] Mode={args.mode} — activation quant disabled (a16), skipping hook collection")
 
@@ -435,6 +468,7 @@ def main():
 
     cache = build_lsgquant_calibration_cache(
         act_stats,
+        output_stats=output_stats,
         metadata={
             "mode": args.mode,
             "num_samples": args.num_samples,

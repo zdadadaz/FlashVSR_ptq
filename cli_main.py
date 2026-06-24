@@ -150,6 +150,25 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         help='Comma-separated extra modules to fake-quantize for sensitivity runs: wan_vae,tcdecoder,lq_proj_in,dit_conv3d,all. Only active with FakeQuant_* modes; supports A8W8/A16W8 for conv ops.'
     )
     parser.add_argument(
+        '--fakequant_extra_activation_qdq_mode',
+        type=str,
+        choices=['dynamic_symmetric', 'static_tensor_symmetric'],
+        default='dynamic_symmetric',
+        help='Activation QDQ mode for extra Conv scopes. dynamic_symmetric is runtime per-input-channel; static_tensor_symmetric loads --fakequant_extra_calibration_cache.'
+    )
+    parser.add_argument(
+        '--fakequant_extra_calibration_cache',
+        type=str,
+        default=None,
+        help='JSON cache for static extra Conv scopes, collected by --fakequant_extra_calibrate_cache_out.'
+    )
+    parser.add_argument(
+        '--fakequant_extra_calibrate_cache_out',
+        type=str,
+        default=None,
+        help='Collect calibration hooks for extra Conv scopes during this run and write JSON cache at exit; does not quantize those extra scopes.'
+    )
+    parser.add_argument(
         '--ckpt_path',
         type=str,
         default=None,
@@ -600,7 +619,10 @@ def main():
         ckpt_path=args.ckpt_path,
         w8a8_engine=args.w8a8_engine,
         trt_engine_path=args.trt_engine,
-        fakequant_extra_scopes=args.fakequant_extra_scopes
+        fakequant_extra_scopes=args.fakequant_extra_scopes,
+        fakequant_extra_calibration_cache=args.fakequant_extra_calibration_cache,
+        fakequant_extra_calibrate_cache_out=args.fakequant_extra_calibrate_cache_out,
+        fakequant_extra_activation_qdq_mode=args.fakequant_extra_activation_qdq_mode
     )
     
     # ==========================================================================
@@ -694,6 +716,25 @@ def main():
     finally:
         if writer:
             writer.release()
+        if hasattr(pipe, '_fakequant_extra_calibration_hooks'):
+            for hook in getattr(pipe, '_fakequant_extra_calibration_hooks', []):
+                hook.remove()
+            export_fn = getattr(pipe, '_fakequant_extra_calibration_export', None)
+            stats = getattr(pipe, '_fakequant_extra_calibration_stats', None)
+            stats_list = getattr(pipe, '_fakequant_extra_calibration_stats_list', None)
+            if stats is None and stats_list is not None:
+                stats = {}
+                for item in stats_list:
+                    stats.update(item)
+            out_path = getattr(pipe, '_fakequant_extra_calibration_out', None)
+            if export_fn is not None and stats is not None and out_path:
+                cache = export_fn(stats)
+                import json
+                from pathlib import Path
+                out_path = Path(out_path)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(json.dumps(cache, indent=2))
+                print(f"FakeQuant extra calibration cache saved: {out_path} ({cache.get('summary', {}).get('num_layers', 0)} layers)")
     
     # ==========================================================================
     # Cleanup

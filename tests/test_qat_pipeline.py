@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from scripts.qat.finetune_fakequant_dit import LatentManifestDataset, move_sample
+from scripts.qat.finetune_fakequant_dit import LatentManifestDataset, move_sample, policy_requires_static_observer
 from scripts.qat.make_static_mixed_policy import build_policy
 from scripts.qat.prepare_video_manifest import (
     deterministic_context,
@@ -302,6 +302,12 @@ def test_static_mixed_policy_keeps_sensitive_layers_a16_and_attention_static_a8(
         "reason": "attention_static_a8",
     }
     assert policy["layers"]["blocks.0.cross_attn.o"]["activation_qdq_mode"] == "static_asymmetric"
+
+
+def test_policy_requires_static_observer_for_mixed_policy_static_layers():
+    assert policy_requires_static_observer(None, "static_asymmetric") is True
+    assert policy_requires_static_observer({"x": {"activation_qdq_mode": "static_asymmetric"}}, "dynamic_asymmetric") is True
+    assert policy_requires_static_observer({"x": {"activation_qdq_mode": "dynamic_asymmetric"}}, "dynamic_asymmetric") is False
 
 
 def test_latent_manifest_dataset_accepts_repo_relative_sample_paths(tmp_path):

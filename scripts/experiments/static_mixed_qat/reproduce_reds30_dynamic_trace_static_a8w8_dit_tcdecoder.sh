@@ -23,28 +23,18 @@ REPRO_SCRIPT="scripts/experiments/static_mixed_qat/reproduce_reds30_dynamic_trac
 mkdir -p "$BASE_OUT/dynamic_asym" "$BASE_OUT/static_token" "$BASE_OUT/tcdecoder_static" "$BASE_OUT/eval" "$(dirname "$REDS4_000_INPUT")"
 printf '%s\n' "$STAMP" > "$BASE_OUT/STAMP"
 
-"$PY" - <<PY
-from pathlib import Path
-import cv2
-lq = Path('$REDS4_000_LQ_DIR')
-out = Path('$REDS4_000_INPUT')
-files = sorted(lq.glob('*.png'))
-if len(files) < int('$FRAMES'):
-    raise SystemExit(f'Expected at least $FRAMES REDS4/000 LQ frames in {lq}, got {len(files)}')
-img = cv2.imread(str(files[0]), cv2.IMREAD_COLOR)
-if img is None:
-    raise SystemExit(f'Failed to read first REDS4 frame: {files[0]}')
-h, w = img.shape[:2]
-out.parent.mkdir(parents=True, exist_ok=True)
-writer = cv2.VideoWriter(str(out), cv2.VideoWriter_fourcc(*'mp4v'), 25.0, (w, h))
-for f in files:
-    frame = cv2.imread(str(f), cv2.IMREAD_COLOR)
-    if frame is None:
-        raise SystemExit(f'Failed to read REDS4 frame: {f}')
-    writer.write(frame)
-writer.release()
-print(f'wrote REDS4/000 LQ video: {out} frames={len(files)} size={w}x{h}')
-PY
+frame_count=$(find "$REDS4_000_LQ_DIR" -maxdepth 1 -name '*.png' | wc -l)
+if (( frame_count < FRAMES )); then
+  echo "Expected at least $FRAMES REDS4/000 LQ frames in $REDS4_000_LQ_DIR, got $frame_count" >&2
+  exit 1
+fi
+ffmpeg -y -hide_banner -loglevel error \
+  -framerate 25 -start_number 0 -i "$REDS4_000_LQ_DIR/%04d.png" \
+  -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -movflags +faststart \
+  "$REDS4_000_INPUT"
+ffprobe -hide_banner -v error \
+  -show_entries stream=codec_name,codec_tag_string,pix_fmt,width,height,nb_frames \
+  -of compact=p=0:nk=1 "$REDS4_000_INPUT"
 
 "$PY" - <<PY
 import json

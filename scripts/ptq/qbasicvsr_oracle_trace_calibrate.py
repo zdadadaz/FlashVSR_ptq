@@ -30,7 +30,11 @@ sys.path.insert(0, str(ROOT))
 
 from cli_main import VideoReader, VideoWriter  # noqa: E402
 from scripts.ptq.fakequant_calibrate import build_lsgquant_calibration_cache  # noqa: E402
-from src.models.quantization.fakequant import FakeQuantLinear  # noqa: E402
+from src.models.quantization.fakequant import (  # noqa: E402
+    FakeQuantLinear,
+    attach_fakequant_conv_calibration_hooks,
+    export_fakequant_conv_calibration_cache,
+)
 
 
 def install_comfy_mocks(models_dir: str | None = None) -> None:
@@ -185,6 +189,16 @@ def main() -> None:
     ap.add_argument("--sparse_ratio", type=float, default=2.0)
     ap.add_argument("--kv_ratio", type=float, default=3.0)
     ap.add_argument("--local_range", type=int, default=9)
+    ap.add_argument(
+        "--extra_calibration_cache_out",
+        default="",
+        help="Optional JSON cache for extra scopes collected from the same dynamic trace path.",
+    )
+    ap.add_argument(
+        "--extra_calibration_scopes",
+        default="",
+        help="Comma-separated extra scopes to hook while replaying calibration inputs; currently supports tcdecoder.",
+    )
     args = ap.parse_args()
     inputs: list[str] = []
     if args.input_list:
@@ -241,6 +255,24 @@ def main() -> None:
     )
     dit = pipe.denoising_model()
     hooks, raw_act, raw_out = register_linear_hooks(dit, calibration_granularity=args.calibration_granularity)
+    extra_hooks = []
+    extra_stats_list = []
+    extra_scopes = {x.strip().lower() for x in (args.extra_calibration_scopes or "").split(",") if x.strip()}
+    if args.extra_calibration_cache_out:
+        unsupported = sorted(extra_scopes - {"tcdecoder"})
+        if unsupported:
+            raise SystemExit(f"Unsupported extra calibration scope(s): {unsupported}")
+        if "tcdecoder" in extra_scopes:
+            if getattr(pipe, "TCDecoder", None) is None:
+                raise RuntimeError("Requested tcdecoder extra calibration, but pipeline has no TCDecoder")
+            tc_hooks, tc_stats = attach_fakequant_conv_calibration_hooks(
+                pipe.TCDecoder,
+                prefix="tcdecoder",
+                op_types=("linear", "conv2d", "conv3d"),
+            )
+            extra_hooks.extend(tc_hooks)
+            extra_stats_list.append(tc_stats)
+            print(f"[oracle-trace] registered TCDecoder extra hooks: {len(tc_hooks)}", flush=True)
     print(f"[oracle-trace] registered Linear hooks: {len(hooks)}", flush=True)
     if len(hooks) != 306:
         raise RuntimeError(f"Expected 306 WanVideoDiT Linear hooks, got {len(hooks)}")
@@ -290,6 +322,8 @@ def main() -> None:
     finally:
         for h in hooks:
             h.remove()
+        for h in extra_hooks:
+            h.remove()
         if writer is not None:
             writer.release()
 
@@ -328,6 +362,33 @@ def main() -> None:
     out_cache.parent.mkdir(parents=True, exist_ok=True)
     out_cache.write_text(json.dumps(cache, indent=2))
     print(f"[oracle-trace] wrote {out_cache} with {len(cache)-1} layers", flush=True)
+
+    if args.extra_calibration_cache_out:
+        extra_stats = {}
+        for item in extra_stats_list:
+            extra_stats.update(item)
+        extra_cache = export_fakequant_conv_calibration_cache(extra_stats)
+        extra_cache.setdefault("metadata", {})
+        extra_cache["metadata"].update({
+            "trace_path": "cli_main/nodes.flashvsr real inference",
+            "input_glob": args.input_glob,
+            "input_list": args.input_list,
+            "input_count": len(inputs),
+            "inputs": inputs,
+            "frames": args.frames,
+            "checkpoint": args.checkpoint,
+            "trace_quantize_mode": args.trace_quantize_mode,
+            "extra_calibration_scopes": sorted(extra_scopes),
+            "notes": "Extra scope activations captured during the same dynamic FakeQuant DiT REDS30 trace.",
+        })
+        extra_out = Path(args.extra_calibration_cache_out)
+        extra_out.parent.mkdir(parents=True, exist_ok=True)
+        extra_out.write_text(json.dumps(extra_cache, indent=2))
+        print(
+            f"[oracle-trace] wrote extra calibration cache {extra_out} "
+            f"with {extra_cache.get('summary', {}).get('num_layers', 0)} layers",
+            flush=True,
+        )
 
     del pipe
     gc.collect()

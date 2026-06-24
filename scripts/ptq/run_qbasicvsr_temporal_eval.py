@@ -97,6 +97,14 @@ def main() -> None:
     ap.add_argument("--teacher_ft_steps", type=int, default=0)
     ap.add_argument("--static_ablation_label", default="")
     ap.add_argument("--reproduce_script", default="", help="Script that reproduces this leaderboard row/eval")
+    ap.add_argument("--fakequant_extra_scopes", default="", help="Comma-separated extra FakeQuant scopes for PTQ eval, e.g. tcdecoder")
+    ap.add_argument("--fakequant_extra_calibration_cache", default="", help="Calibration cache for --fakequant_extra_scopes")
+    ap.add_argument(
+        "--fakequant_extra_activation_qdq_mode",
+        default="static_tensor_symmetric",
+        choices=["dynamic_symmetric", "static_tensor_symmetric"],
+        help="Activation QDQ mode passed to cli_main for extra FakeQuant scopes.",
+    )
     args = ap.parse_args()
 
     root = Path.cwd()
@@ -111,7 +119,13 @@ def main() -> None:
     if not args.fp16_video:
         _run([sys.executable, "cli_main.py", "--input", args.input_video, "--output", str(fp16_video), "--scale", "4", "--mode", "tiny", "--end_frame", str(args.frames), "--quantize_mode", "None"], cwd=root, dry_run=args.dry_run)
     if not args.ptq_video:
-        _run([sys.executable, "cli_main.py", "--input", args.input_video, "--output", str(ptq_video), "--scale", "4", "--mode", "tiny", "--end_frame", str(args.frames), "--ckpt_path", args.checkpoint, "--quantize_mode", _quantize_mode(policy)], cwd=root, dry_run=args.dry_run)
+        ptq_cmd = [sys.executable, "cli_main.py", "--input", args.input_video, "--output", str(ptq_video), "--scale", "4", "--mode", "tiny", "--end_frame", str(args.frames), "--ckpt_path", args.checkpoint, "--quantize_mode", _quantize_mode(policy)]
+        if args.fakequant_extra_scopes:
+            ptq_cmd.extend(["--fakequant_extra_scopes", args.fakequant_extra_scopes])
+            if args.fakequant_extra_calibration_cache:
+                ptq_cmd.extend(["--fakequant_extra_calibration_cache", args.fakequant_extra_calibration_cache])
+            ptq_cmd.extend(["--fakequant_extra_activation_qdq_mode", args.fakequant_extra_activation_qdq_mode])
+        _run(ptq_cmd, cwd=root, dry_run=args.dry_run)
 
     if not args.dry_run:
         for video in (fp16_video, ptq_video):
@@ -125,11 +139,13 @@ def main() -> None:
 
     a8, a16, a4 = _mode_counts(policy)
     notes = (
-        "QBasicVSR-inspired temporal policy; quant_scope=dit_linear_only; "
-        f"wan_vae_quantized=false; bv={policy.get('video_bit_factor')}; base_bits={policy.get('base_bits')}; "
+        f"QBasicVSR-inspired temporal policy; quant_scope={policy.get('quant_scope')}; "
+        f"wan_vae_quantized={str(bool(policy.get('wan_vae_quantized', False))).lower()}; "
         f"FAB={policy.get('fab')}; flow_backend={policy.get('flow_backend', 'proxy')}; a4_layers={a4}; "
         f"clipping_method={args.clipping_method}; teacher_ft_steps={args.teacher_ft_steps}; "
-        f"static_ablation_label={args.static_ablation_label}"
+        f"static_ablation_label={args.static_ablation_label}; "
+        f"fakequant_extra_scopes={args.fakequant_extra_scopes}; "
+        f"fakequant_extra_activation_qdq_mode={args.fakequant_extra_activation_qdq_mode}"
     )
     manifest = {
         "schema_version": "flashvsr.qbasicvsr.temporal_eval.v1",
@@ -147,6 +163,9 @@ def main() -> None:
         "teacher_ft_steps": args.teacher_ft_steps,
         "static_ablation_label": args.static_ablation_label,
         "reproduce_script": args.reproduce_script,
+        "fakequant_extra_scopes": args.fakequant_extra_scopes,
+        "fakequant_extra_calibration_cache": args.fakequant_extra_calibration_cache,
+        "fakequant_extra_activation_qdq_mode": args.fakequant_extra_activation_qdq_mode,
         "notes": notes,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))

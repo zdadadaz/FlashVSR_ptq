@@ -11,7 +11,8 @@ cd "$ROOT"
 PY="${PY:-.venv/bin/python}"
 FP_CKPT="${FP_CKPT:-models/FlashVSR-v1.1/diffusion_pytorch_model_streaming_dmd.safetensors}"
 REDS30_GLOB="${REDS30_GLOB:-/home/user/data/REDs/REDS30_videos/LQ/*.mp4}"
-REDS4_000_INPUT="${REDS4_000_INPUT:-/home/user/data/REDs/REDS30_videos/LQ/000.mp4}"
+REDS4_000_LQ_DIR="${REDS4_000_LQ_DIR:-datasets/test/REDS4/LQ/000}"
+REDS4_000_INPUT="${REDS4_000_INPUT:-outputs/static_mixed_qat/reds4_000_lq_from_datasets_test.mp4}"
 FRAMES="${FRAMES:-16}"
 STAMP="${STAMP:-$(date +%Y%m%d_%H%M%S)}"
 BASE_OUT="${BASE_OUT:-outputs/static_mixed_qat/${STAMP}_reds30_dynamic_trace_static_a8w8_dit_tcdecoder}"
@@ -19,8 +20,31 @@ LEADERBOARD="${LEADERBOARD:-outputs/static_mixed_qat/leaderboard.jsonl}"
 DAILY_DIR="${DAILY_DIR:-/home/user/SynologyDrive/daily}"
 REPRO_SCRIPT="scripts/experiments/static_mixed_qat/reproduce_reds30_dynamic_trace_static_a8w8_dit_tcdecoder.sh"
 
-mkdir -p "$BASE_OUT/dynamic_asym" "$BASE_OUT/static_token" "$BASE_OUT/tcdecoder_static" "$BASE_OUT/eval"
+mkdir -p "$BASE_OUT/dynamic_asym" "$BASE_OUT/static_token" "$BASE_OUT/tcdecoder_static" "$BASE_OUT/eval" "$(dirname "$REDS4_000_INPUT")"
 printf '%s\n' "$STAMP" > "$BASE_OUT/STAMP"
+
+"$PY" - <<PY
+from pathlib import Path
+import cv2
+lq = Path('$REDS4_000_LQ_DIR')
+out = Path('$REDS4_000_INPUT')
+files = sorted(lq.glob('*.png'))
+if len(files) < int('$FRAMES'):
+    raise SystemExit(f'Expected at least $FRAMES REDS4/000 LQ frames in {lq}, got {len(files)}')
+img = cv2.imread(str(files[0]), cv2.IMREAD_COLOR)
+if img is None:
+    raise SystemExit(f'Failed to read first REDS4 frame: {files[0]}')
+h, w = img.shape[:2]
+out.parent.mkdir(parents=True, exist_ok=True)
+writer = cv2.VideoWriter(str(out), cv2.VideoWriter_fourcc(*'mp4v'), 25.0, (w, h))
+for f in files:
+    frame = cv2.imread(str(f), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise SystemExit(f'Failed to read REDS4 frame: {f}')
+    writer.write(frame)
+writer.release()
+print(f'wrote REDS4/000 LQ video: {out} frames={len(files)} size={w}x{h}')
+PY
 
 "$PY" - <<PY
 import json
@@ -93,7 +117,7 @@ RUN_ID="${STAMP}_reds30_static_a8w8_dit_tcdecoder_reds4_000_first16"
   --checkpoint "$BASE_OUT/static_token/checkpoint.safetensors" \
   --input_video "$REDS4_000_INPUT" \
   --frames "$FRAMES" \
-  --eval_set "REDS4_000_first16_video_vs_fp16_static_dit_tcdecoder" \
+  --eval_set "datasets_test_REDS4_000_first${FRAMES}_video_vs_fp16_static_dit_tcdecoder" \
   --clipping_method none \
   --teacher_ft_steps 0 \
   --static_ablation_label reds30_dynamic_trace_static_a8w8_dit_tcdecoder \

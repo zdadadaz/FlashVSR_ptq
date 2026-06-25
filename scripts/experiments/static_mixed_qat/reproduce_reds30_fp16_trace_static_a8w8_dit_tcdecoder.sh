@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# REDS30 FP16-trace static A8W8 ablation for DiT + TCDecoder, then REDS4/000 eval vs FP16.
+# Purpose:
+#   Test whether static_token_asymmetric A8W8 qparams calibrated from the FP16 inference
+#   trajectory perform similarly to qparams calibrated from the dynamic-quantized trajectory.
+#
+# Matched-control script:
+#   scripts/experiments/static_mixed_qat/reproduce_reds30_dynamic_trace_static_a8w8_dit_tcdecoder.sh
+#
+# Contract:
+#   - Calibration and inference use the same real cli_main/nodes FlashVSR pipeline settings as the
+#     dynamic-trace script: REDS30, first 16 frames, tiny, bf16, tiled VAE/DiT, sparse_sage_attention.
+#   - Calibration trace differs only in DiT state: FP16 DiT with --trace_quantize_mode None.
+#   - Converted eval checkpoint is static_token_asymmetric A8W8 DiT Linear.
+#   - TCDecoder Conv2d/Conv3d/Linear is hooked during the same FP16 trace and applied as static extra-op A8W8 at eval.
+#   - Wan VAE remains unquantized.
+set -euo pipefail
+
+ROOT="${ROOT:-/home/user/apps/FlashVSRptq/FlashVSR_Integrated}"
+cd "$ROOT"
+PY="${PY:-.venv/bin/python}"
+FP_CKPT="${FP_CKPT:-models/FlashVSR-v1.1/diffusion_pytorch_model_streaming_dmd.safetensors}"
+REDS30_GLOB="${REDS30_GLOB:-/home/user/data/REDs/REDS30_videos/LQ/*.mp4}"
+REDS4_000_LQ_DIR="${REDS4_000_LQ_DIR:-datasets/test/REDS4/LQ/000}"
+REDS4_000_INPUT="${REDS4_000_INPUT:-outputs/static_mixed_qat/reds4_000_lq_from_datasets_test.mp4}"
+FRAMES="${FRAMES:-16}"
+STAMP="${STAMP:-$(date +%Y%m%d_%H%M%S)}"
+BASE_OUT="${BASE_OUT:-outputs/static_mixed_qat/${STAMP}_reds30_fp16_trace_static_a8w8_dit_tcdecoder}"
+LEADERBOARD="${LEADERBOARD:-outputs/static_mixed_qat/leaderboard.jsonl}"
+DAILY_DIR="${DAILY_DIR:-/home/user/SynologyDrive/daily}"
+REPRO_SCRIPT="scripts/experiments/static_mixed_qat/reproduce_reds30_fp16_trace_static_a8w8_dit_tcdecoder.sh"
+ABLATION_LABEL="reds30_fp16_trace_static_a8w8_dit_tcdecoder"
+
+mkdir -p "$BASE_OUT/static_token" "$BASE_OUT/tcdecoder_static" "$BASE_OUT/eval" "$(dirname "$REDS4_000_INPUT")" "$DAILY_DIR"
+printf '%s\n' "$STAMP" > "$BASE_OUT/STAMP"
+
+log_daily() {
+  local msg="$1"
+  printf '[%s] %s\n' "$(date '+%F %T')" "$msg" | tee -a "$DAILY_DIR/${STAMP}_${ABLATION_LABEL}.log"
+}
+
+remove_eval_outputs() {
+  local run_id="$1"
+  local out_dir="outputs/qbasicvsr/eval/${run_id}"
+  rm -f "$out_dir/fp16.mp4" "$out_dir/ptq.mp4" "$out_dir/psnr.json" "$out_dir/manifest.json"
+}
+
+log_daily "start BASE_OUT=$BASE_OUT"
+
+frame_count=$(find "$REDS4_000_LQ_DIR" -maxdepth 1 -name '*.png' | wc -l)
+if (( frame_count < FRAMES )); then
+  echo "Expected at least $FRAMES REDS4/000 LQ frames in $REDS4_000_LQ_DIR, got $frame_count" >&2
+  exit 1
+fi
+ffmpeg -y -hide_banner -loglevel error \
+  -framerate 25 -start_number 0 -i "$REDS4_000_LQ_DIR/%04d.png" \
+  -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -movflags +faststart \
+  "$REDS4_000_INPUT"
+ffprobe -hide_banner -v error \
+  -show_entries stream=codec_name,codec_tag_string,pix_fmt,width,height,nb_frames \
+  -of compact=p=0:nk=1 "$REDS4_000_INPUT" | tee "$BASE_OUT/reds4_000_input_ffprobe.txt"
+
+"$PY" - <<PY
+import json
+from pathlib import Path
+import torch.nn as nn
+from scripts.ptq.fakequant_convert import build_dit
+base = Path('$BASE_OUT')
+layer_names = [name for name, module in build_dit().named_modules() if isinstance(module, nn.Linear)]
+if len(layer_names) != 306:
+    raise SystemExit(f'Expected 306 Linear layers, got {len(layer_names)}')
+note = 'all 306 DiT Linear A8W8; frozen per-token qparams captured from REDS30 FP16 CLI trajectory; TCDecoder static A8W8 applied via extra-op cache at eval'
+policy = {
+    'schema_version': 'flashvsr.reds30.fp16_trace_static_token.v1',
+    'quant_scope': 'dit_linear_plus_tcdecoder_extra_ops',
+    'wan_vae_quantized': False,
+    'tcdecoder_quantized': True,
+    'tcdecoder_activation_qdq_mode': 'static_tensor_symmetric/static_token_asymmetric',
+    'activation_qdq_mode': 'static_token_asymmetric',
+    'static_ablation_label': '$ABLATION_LABEL',
+    'calibration_reference_model': 'fp16',
+    'matched_control_script': 'scripts/experiments/static_mixed_qat/reproduce_reds30_dynamic_trace_static_a8w8_dit_tcdecoder.sh',
+    'counts': {'a8w8': len(layer_names), 'a16w8': 0, 'fp16_skip': 0, 'a4w4': 0},
+    'layers': {name: {'mode': 'a8w8', 'activation_qdq_mode': 'static_token_asymmetric', 'reason': note} for name in layer_names},
+    'notes': note,
+}
+out = base / 'static_token' / 'policy.json'
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps(policy, indent=2, sort_keys=True))
+PY
+
+log_daily "calibrating FP16 trace"
+"$PY" -u scripts/ptq/qbasicvsr_oracle_trace_calibrate.py \
+  --input_glob "$REDS30_GLOB" \
+  --max_inputs 30 \
+  --output_cache "$BASE_OUT/static_token/calib_cache_reds30_fp16_trace.json" \
+  --extra_calibration_cache_out "$BASE_OUT/tcdecoder_static/calib_cache_reds30_fp16_trace.json" \
+  --extra_calibration_scopes tcdecoder \
+  --frames "$FRAMES" \
+  --checkpoint "$FP_CKPT" \
+  --trace_quantize_mode None \
+  --allow_fp_trace_diagnostic \
+  --mode tiny \
+  --scale 4 \
+  --precision bf16 \
+  --calibration_granularity per_token \
+  --tiled_vae --tiled_dit --tile_size 256 --tile_overlap 24 \
+  --attention_mode sparse_sage_attention --sparse_ratio 2.0 --kv_ratio 3.0 --local_range 9 \
+  > "$BASE_OUT/01_calibrate_reds30_fp16_trace_dit_tcdecoder.log" 2>&1
+
+log_daily "converting static token checkpoint"
+"$PY" scripts/ptq/fakequant_convert.py \
+  --checkpoint "$FP_CKPT" \
+  --calibration_cache "$BASE_OUT/static_token/calib_cache_reds30_fp16_trace.json" \
+  --output "$BASE_OUT/static_token/checkpoint.safetensors" \
+  --mode a8w8 \
+  --activation_qdq_mode static_token_asymmetric \
+  --policy "$BASE_OUT/static_token/policy.json" \
+  > "$BASE_OUT/02_convert_static_token.log" 2>&1
+
+RUN_ID="${STAMP}_${ABLATION_LABEL}_reds4_000_first${FRAMES}"
+remove_eval_outputs "$RUN_ID"
+log_daily "evaluating RUN_ID=$RUN_ID"
+"$PY" scripts/ptq/run_qbasicvsr_temporal_eval.py \
+  --run_id "$RUN_ID" \
+  --policy "$BASE_OUT/static_token/policy.json" \
+  --checkpoint "$BASE_OUT/static_token/checkpoint.safetensors" \
+  --input_video "$REDS4_000_INPUT" \
+  --frames "$FRAMES" \
+  --eval_set "datasets_test_REDS4_000_first${FRAMES}_video_vs_fp16_static_dit_tcdecoder" \
+  --clipping_method none \
+  --teacher_ft_steps 0 \
+  --static_ablation_label "$ABLATION_LABEL" \
+  --fakequant_extra_scopes tcdecoder \
+  --fakequant_extra_calibration_cache "$BASE_OUT/tcdecoder_static/calib_cache_reds30_fp16_trace.json" \
+  --fakequant_extra_activation_qdq_mode static_tensor_symmetric \
+  --reproduce_script "$REPRO_SCRIPT" \
+  --leaderboard "$LEADERBOARD" \
+  --daily_dir "$DAILY_DIR" \
+  > "$BASE_OUT/03_eval_reds4_000_static_dit_tcdecoder.log" 2>&1
+
+"$PY" scripts/experiments/static_mixed_qat/render_leaderboard.py \
+  --leaderboard "$LEADERBOARD" \
+  --output "${LEADERBOARD%.jsonl}.html"
+PREFIX="$(date +%Y%m%d)"
+cp "$LEADERBOARD" "$DAILY_DIR/${PREFIX}_flashvsr_static_mixed_leaderboard.jsonl"
+cp "${LEADERBOARD%.jsonl}.html" "$DAILY_DIR/${PREFIX}_flashvsr_static_mixed_leaderboard.html"
+
+"$PY" - <<PY
+import json
+from pathlib import Path
+base = Path('$BASE_OUT')
+summary = {
+    'stamp': '$STAMP',
+    'base_out': str(base),
+    'ablation_label': '$ABLATION_LABEL',
+    'calibration_reference_model': 'fp16',
+    'matched_dynamic_trace_script': 'scripts/experiments/static_mixed_qat/reproduce_reds30_dynamic_trace_static_a8w8_dit_tcdecoder.sh',
+    'dit_calibration_cache': str(base / 'static_token/calib_cache_reds30_fp16_trace.json'),
+    'tcdecoder_calibration_cache': str(base / 'tcdecoder_static/calib_cache_reds30_fp16_trace.json'),
+    'static_dit_checkpoint': str(base / 'static_token/checkpoint.safetensors'),
+    'policy': str(base / 'static_token/policy.json'),
+    'reds4_run_id': '$RUN_ID',
+    'reds4_eval_dir': f'outputs/qbasicvsr/eval/$RUN_ID',
+    'reds4_psnr_json': f'outputs/qbasicvsr/eval/$RUN_ID/psnr.json',
+    'leaderboard': '$LEADERBOARD',
+    'leaderboard_html': '${LEADERBOARD%.jsonl}.html',
+    'daily_log': '$DAILY_DIR/${STAMP}_${ABLATION_LABEL}.log',
+}
+(base / 'summary.json').write_text(json.dumps(summary, indent=2))
+Path('$DAILY_DIR/${STAMP}_${ABLATION_LABEL}_summary.json').write_text(json.dumps(summary, indent=2))
+print(json.dumps(summary, indent=2))
+PY
+log_daily "done"

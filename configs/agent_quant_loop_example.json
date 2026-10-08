@@ -1,0 +1,75 @@
+{
+  "run_name": "2026-10-09_a8w8_sweep",
+  "checkpoint": "models/FlashVSR-v1.1/dit.safetensors",
+  "data_dir": "data/lowres",
+  "fp16_ref_dir": "outputs/ptq_recovery/2026-08-personA/eval/20260602_173721_august_B_train10_static_asym/videos/validation_set",
+  "clips": ["bowing_cif", "bus_cif", "carphone_qcif", "city_cif", "coastguard_cif"],
+  "render": {
+    "model": "FlashVSR-v1.1",
+    "vae_model": "Wan2.1",
+    "scale": 4,
+    "mode": "full",
+    "precision": "fp16",
+    "device": "cuda:0",
+    "attention_mode": "sdpa",
+    "start_frame": 0,
+    "end_frame": 16,
+    "seed": 0
+  },
+  "variants": [
+    {
+      "name": "a8w8_static_asym",
+      "quantize_mode": "FakeQuant_A8W8",
+      "gate_psnr_db": 30.0,
+      "calib": {
+        "mode": "a8w8",
+        "dataset_train": "datasets/train",
+        "num_videos": 10,
+        "num_samples": 64,
+        "calib_frames": 32,
+        "latent_size": "60x80",
+        "seed": 42
+      },
+      "convert": {
+        "mode": "a8w8",
+        "activation_qdq_mode": "static_asymmetric"
+      }
+    },
+    {
+      "name": "a8w8_draq",
+      "quantize_mode": "FakeQuant_A8W8_DRAQ",
+      "gate_psnr_db": 30.0,
+      "calib": {
+        "mode": "a8w8",
+        "dataset_train": "datasets/train",
+        "num_videos": 10,
+        "num_samples": 64,
+        "calib_frames": 32,
+        "latent_size": "60x80",
+        "seed": 42
+      },
+      "convert": {
+        "mode": "a8w8",
+        "draq_qrange": "signed_symmetric"
+      }
+    },
+    {
+      "name": "a16w4_sensitive_a16_fallback",
+      "quantize_mode": "FakeQuant_A16W4",
+      "gate_psnr_db": 32.0,
+      "calib": {
+        "mode": "a16w4",
+        "dataset_train": "datasets/train",
+        "num_videos": 10,
+        "num_samples": 64,
+        "calib_frames": 32,
+        "latent_size": "60x80",
+        "seed": 42
+      },
+      "convert": {
+        "mode": "a16w4",
+        "static_quality_policy": "sensitive_a16"
+      }
+    }
+  ]
+}

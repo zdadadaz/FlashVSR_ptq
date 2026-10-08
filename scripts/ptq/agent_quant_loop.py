@@ -49,6 +49,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 LOG_TAIL_LINES = 40
+FPS_RE = re.compile(r"\((\d+\.?\d*)\s+FPS\)")
+
+
+def extract_fps(log_path: Path) -> float | None:
+    """Pull the '(NN.NN FPS)' line out of a cli_main.py render log."""
+    try:
+        with log_path.open() as f:
+            m = FPS_RE.search(f.read())
+        return float(m.group(1)) if m else None
+    except OSError:
+        return None
 
 
 def slug(s: str) -> str:
@@ -132,6 +143,9 @@ def main() -> int:
                     help="Print the full command plan + manifest, execute nothing")
     ap.add_argument("--metrics-only", action="store_true",
                     help="Skip calib/convert/render; only recompute PSNR metrics from existing videos")
+    ap.add_argument("--db", default=os.environ.get("AGENT_RESULT_DB",
+                    str(ROOT / "outputs" / "agent_loop" / "results.db")),
+                    help="SQLite result database to auto-ingest after the run")
     args = ap.parse_args()
 
     cfg = json.loads(Path(args.config).read_text())
@@ -254,11 +268,16 @@ def main() -> int:
                     subprocess.run(step["cmd"], cwd=ROOT, check=True,
                                    capture_output=True, text=True)
                     metric = json.loads(step["psnr_json"].read_text())
+                    psnrs = metric.get("psnr_per_frame_db", [])
+                    std = (sum((p - metric["psnr_avg_db"]) ** 2 for p in psnrs) / len(psnrs)) ** 0.5 if psnrs else None
+                    fps = extract_fps(logs_dir / f"{vs}_{slug(step['clip'])}_render.log")
                     clip_rows.append({
                         "clip": step["clip"],
                         "frames": metric["frames"],
                         "psnr_avg_db": metric["psnr_avg_db"],
                         "psnr_min_db": metric["psnr_min_db"],
+                        "psnr_std_db": std,
+                        "fps": fps,
                     })
                 except Exception as e:
                     failed_stage = f"psnr ({step['clip']}): {e}"
@@ -292,6 +311,7 @@ def main() -> int:
 
     summary = {
         "run": str(run_dir),
+        "run_id": run_name,
         "timestamp": datetime.datetime.now().isoformat(),
         "variants": rows,
         "all_passed": all_pass,
@@ -314,8 +334,23 @@ def main() -> int:
                       "```", r["log_tail"].rstrip(), "```"]
     report = reports_dir / f"{ts}_summary.md"
     report.write_text("\n".join(lines) + "\n")
+
+    # Auto-ingest into the cross-run result DB (the "AI Researcher" reads the
+    # DB, not raw run folders). Best-effort: never fail the run over the DB.
+    db_note = "skipped"
+    try:
+        (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+        subprocess.run([python, str(ROOT / "scripts" / "ptq" / "agent_result_db.py"),
+                        "--db", args.db,
+                        "--ingest", str(metrics_dir / "validation_set_psnr_summary.json"),
+                        "--config", str(run_dir / "config.json")],
+                       cwd=ROOT, check=True, capture_output=True, text=True)
+        db_note = args.db
+    except Exception as e:
+        db_note = f"ingest failed: {e}"
+
     print(json.dumps({"summary_json": str(metrics_dir / "validation_set_psnr_summary.json"),
-                      "report": str(report), "all_passed": all_pass}, indent=2))
+                      "report": str(report), "all_passed": all_pass, "db": db_note}, indent=2))
     return 0 if all_pass else 1
 
 

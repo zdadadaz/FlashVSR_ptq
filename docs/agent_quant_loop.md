@@ -38,6 +38,19 @@ check that made their kernel agent work.
 - Seeds and frame windows are pinned in `render` so renders are reproducible.
 - The harness never lets the agent edit the scoring code path; only configs.
 
+## Cross-run memory: the result database
+
+`scripts/ptq/agent_result_db.py` (SQLite, default `outputs/agent_loop/results.db`)
+is the "Result Database" layer. The loop auto-ingests after every run; the
+agent's "next hypothesis" step queries the DB instead of digging through run
+folders:
+
+- `--top N` — variants ranked by mean PSNR with avg FPS (Pareto view)
+- `--runs` / `--detail <run_id>` — history and per-clip rows
+- `--query quantize_mode=FakeQuant_A8W8` — filter by knob
+- Config JSON is archived inside each DB row, so a winning config is fully
+  reproducible from the DB alone.
+
 ## What the agent should NOT be asked to do
 
 - Invent quantization theory (mode 7/8-style insights stay human).
